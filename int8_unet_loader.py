@@ -42,11 +42,11 @@ def get_model_type_exclusions(model_type):
         ]
     if model_type == "ernie":
         return [
-            "time", "x_embedder", "adaLN", "final", "text_proj", "norm", "layers.0.", "layers.35",
+            "time", "x_embedder", "text_proj", "adaLN",
         ]
     if model_type == "anima":
         return [
-            "embed", "llm", "blocks.0.", "blocks.1.", "blocks.2.",
+            "embed", "llm", "adaln",
         ]
     if model_type == "sdxl":
         return [

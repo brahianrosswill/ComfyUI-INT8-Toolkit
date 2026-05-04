@@ -93,15 +93,14 @@ MODEL_TYPE_FINGERPRINTS = {
 	),
 	"ernie": (
 		"text_proj",
-		"layers.35",
+		"time",
 		"x_embedder",
 		"adaLN",
 	),
 	"anima": (
+		"embed",
 		"llm",
-		"blocks.0.",
-		"blocks.1.",
-		"blocks.2.",
+		"adaln",
 	),
 }
 
@@ -110,7 +109,7 @@ MODEL_TYPE_REQUIRED_MARKERS = {
 	"z-image": ("cap_embedder", "context_refiner", "noise_refiner"),
 	"wan": ("patch_embedding", "time_projection"),
 	"ltx2": ("audio_adaln_single", "audio_caption_projection", "audio_patchify_proj"),
-	"ernie": ("text_proj", "layers.35"),
+	"ernie": ("text_proj", "x_embedder"),
 	"anima": ("llm",),
 	"qwen": ("time_text_embed", "norm_out", "proj_out"),
 }

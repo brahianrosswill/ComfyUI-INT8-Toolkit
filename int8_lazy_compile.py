@@ -7,6 +7,7 @@ import torch
 
 _LAZY_COMPILE_WRAPPER_KEY = "int8_lazy_torch_compile"
 _TORCH_COMPILE_KWARGS = "torch_compile_kwargs"
+_WHOLE_MODEL_COMPILE_KEY_LIST = ["diffusion_model"]
 
 
 def _skip_transformer_options_guards(guard_entries):
@@ -37,7 +38,7 @@ def _get_mode_options(mode):
 
 def _get_compile_key_list(diffusion_model, compile_transformer_blocks_only):
 	if not compile_transformer_blocks_only:
-		return ["diffusion_model"]
+		return _WHOLE_MODEL_COMPILE_KEY_LIST
 
 	layer_types = [
 		"double_blocks",
@@ -64,7 +65,28 @@ def _get_compile_key_list(diffusion_model, compile_transformer_blocks_only):
 		return compile_key_list
 
 	logging.warning("INT8 Lazy Torch Compile: no known transformer blocks found; compiling entire diffusion model.")
-	return ["diffusion_model"]
+	return _WHOLE_MODEL_COMPILE_KEY_LIST
+
+
+def _get_int8_adapter_model_type(model_patcher):
+	try:
+		transformer_options = model_patcher.model_options.get("transformer_options", {})
+		adapter_state = transformer_options.get("int8_model_adapter", {})
+		return adapter_state.get("model_type")
+	except Exception:
+		return None
+
+
+def _uses_flux_global_modulation(diffusion_model):
+	params = getattr(diffusion_model, "params", None)
+	return bool(getattr(params, "global_modulation", False))
+
+
+def _should_force_whole_model_compile(model_patcher, diffusion_model):
+	model_type = _get_int8_adapter_model_type(model_patcher)
+	if model_type == "flux2":
+		return True
+	return _uses_flux_global_modulation(diffusion_model)
 
 
 def _make_lazy_compile_wrapper(compile_key_list, compile_kwargs, log_compile):
@@ -149,6 +171,10 @@ class INT8LazyTorchCompile:
 
 		diffusion_model = model_patcher.get_model_object("diffusion_model")
 		compile_key_list = _get_compile_key_list(diffusion_model, bool(compile_transformer_blocks_only))
+		if compile_transformer_blocks_only and _should_force_whole_model_compile(model_patcher, diffusion_model):
+			compile_key_list = _WHOLE_MODEL_COMPILE_KEY_LIST
+			if log_compile:
+				print("[INT8 Lazy Torch Compile] Using whole-model compile for Flux-style global modulation.")
 
 		torch._dynamo.config.cache_size_limit = int(dynamo_cache_size_limit)
 		compile_kwargs = {

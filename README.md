@@ -109,6 +109,7 @@ Enable INT8 on MODEL
 Useful settings:
 
 - `compile_transformer_blocks_only`: defaults to enabled. This compiles recognized repeated transformer block lists instead of the entire diffusion model, reducing cold-start compilation and avoiding some parent-wrapper guard churn.
+- Flux2/Klein-style models with global modulation are automatically compiled as the whole diffusion model, because compiling only `double_blocks` and `single_blocks` can cross an unsafe boundary and produce invalid output.
 - `use_guard_filter`: defaults to enabled. This ignores guards involving `transformer_options`, matching Comfy's stock compile behavior and reducing recompiles caused by per-sampling metadata.
 - `dynamic`: defaults to `true`, which is usually safer when image sizes or batch shapes change. `false` can be faster for fixed shapes.
 - `mode`: supports `default`, `max-autotune`, `max-autotune-no-cudagraphs`, and `reduce-overhead`. With the `inductor` backend and `use_guard_filter` enabled, the node expands the selected mode into Inductor backend options so the guard filter and mode-style tuning can be used together.
