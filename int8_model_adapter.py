@@ -1,4 +1,5 @@
 import logging
+import os
 import uuid
 
 import comfy.lora
@@ -60,6 +61,10 @@ _INT8_MODEL_ADAPTER_ORIGINAL_MODULES_KEY = "int8_model_adapter_original_modules"
 _INT8_MODEL_ADAPTER_OUTPUT_CACHE_KEY = "int8_model_adapter_output_cache"
 _INT8_LORA_SIGNATURE_ATTACHMENT_KEY = "int8_lora_signature"
 _INT8_MODEL_ADAPTER_OUTPUT_CACHE = {}
+try:
+	_INT8_MODEL_ADAPTER_OUTPUT_CACHE_LIMIT = max(0, int(os.environ.get("INT8_MODEL_ADAPTER_OUTPUT_CACHE_LIMIT", "1")))
+except ValueError:
+	_INT8_MODEL_ADAPTER_OUTPUT_CACHE_LIMIT = 1
 
 MODEL_TYPE_FINGERPRINTS = {
 	"flux2": (
@@ -620,6 +625,8 @@ def _get_lora_signature(model_patcher):
 
 
 def _can_cache_adapter_output(model_patcher, lora_signature):
+	if _INT8_MODEL_ADAPTER_OUTPUT_CACHE_LIMIT <= 0:
+		return False
 	if lora_signature is not None:
 		return True
 	return len(getattr(model_patcher, "patches", {})) == 0
@@ -641,7 +648,7 @@ def _build_adapter_cache_key(
 		lora_signature = ("no_lora_patches",)
 
 	return (
-		"v3",
+		"v4",
 		id(getattr(model_patcher, "model", None)),
 		tuple(lora_signature),
 		str(resolved_model_type),
@@ -696,8 +703,12 @@ def _apply_int8_runtime_settings(small_batch_fallback, runtime_backend, prepack_
 def _remember_cached_output(shared_model, cache_key, model_patcher):
 	cache = _get_output_cache(shared_model)
 	cache[cache_key] = model_patcher
-	while len(cache) > 8:
-		cache.pop(next(iter(cache)))
+	while len(cache) > _INT8_MODEL_ADAPTER_OUTPUT_CACHE_LIMIT:
+		old_key = next(iter(cache))
+		if old_key == cache_key and len(cache) > 1:
+			old_key = next(key for key in cache if key != cache_key)
+		cache.pop(old_key)
+	_cleanup_torch_memory()
 
 
 def _collect_int8_candidates(diffusion_model, excluded_names, fast_unsafe=False):
