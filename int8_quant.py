@@ -6,14 +6,32 @@ import torch.nn.functional as F
 import comfy.model_management
 
 _INT8_FORCE_DISABLE_TORCH_COMPILE = os.environ.get("INT8_FORCE_DISABLE_TORCH_COMPILE", "0") == "1"
+_INT8_FILE_SLICE_LOAD_ENABLED = os.environ.get("INT8_FILE_SLICE_LOAD", "1") != "0"
+_INT8_FILE_SLICE_LOAD_WARNED = False
+
+try:
+    import comfy.memory_management as comfy_memory_management
+except Exception:
+    comfy_memory_management = None
+
+try:
+    import comfy_aimdo.host_buffer as comfy_aimdo_host_buffer
+    import comfy_aimdo.torch as comfy_aimdo_torch
+    _AIMDO_FILE_SLICE_LOAD_AVAILABLE = True
+except Exception:
+    comfy_aimdo_host_buffer = None
+    comfy_aimdo_torch = None
+    _AIMDO_FILE_SLICE_LOAD_AVAILABLE = False
 
 # Add this at the top of your file
 try:
     from .int8_fused_kernel import triton_int8_linear
     from .int8_fused_kernel import triton_int8_linear_per_row
     from .int8_fused_kernel import triton_quantize_rowwise
+    from .int8_fused_kernel import TRITON_ROWWISE_QUANT_MAX_COLS
     _TRITON_AVAILABLE = True
 except ImportError:
+    TRITON_ROWWISE_QUANT_MAX_COLS = 8192
     _TRITON_AVAILABLE = False
     print("Triton not found, falling back to torch._int_mm")
 
@@ -109,6 +127,41 @@ def _get_int8_compute_device(fallback_device: torch.device | None = None) -> tor
             return fallback_device
         return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
+def tensor_to_int8_compute_device(tensor: Tensor, device: torch.device | None, non_blocking: bool = True) -> Tensor:
+    if device is None:
+        return tensor
+
+    target_device = torch.device(device)
+    if (
+        not _INT8_FILE_SLICE_LOAD_ENABLED
+        or not _AIMDO_FILE_SLICE_LOAD_AVAILABLE
+        or comfy_memory_management is None
+        or not hasattr(comfy_memory_management, "read_tensor_file_slice_into")
+        or tensor.device.type != "cpu"
+        or target_device.type != "cuda"
+    ):
+        return tensor.to(target_device, non_blocking=non_blocking)
+
+    size = tensor.numel() * tensor.element_size()
+    if size <= 0:
+        return tensor.to(target_device, non_blocking=non_blocking)
+
+    global _INT8_FILE_SLICE_LOAD_WARNED
+    try:
+        host_buffer = comfy_aimdo_host_buffer.HostBuffer(size)
+        host_tensor = comfy_aimdo_torch.hostbuf_to_tensor(host_buffer)
+        host_view = host_tensor[:size].view(dtype=tensor.dtype).view(tensor.shape)
+        if comfy_memory_management.read_tensor_file_slice_into(tensor, host_view):
+            output = torch.empty_like(tensor, device=target_device)
+            output.copy_(host_view, non_blocking=False)
+            return output
+    except Exception as e:
+        if not _INT8_FILE_SLICE_LOAD_WARNED:
+            logging.warning(f"INT8 file-slice load disabled for this tensor; falling back to tensor.to() ({e}).")
+            _INT8_FILE_SLICE_LOAD_WARNED = True
+
+    return tensor.to(target_device, non_blocking=non_blocking)
+
 def _is_float8_dtype(dtype: torch.dtype) -> bool:
     return dtype in _FLOAT8_DTYPES
 
@@ -164,7 +217,7 @@ def quantize_int8_rowwise(x: Tensor) -> tuple[Tensor, Tensor]:
         # Convert FP8 weights to a quantization-friendly compute dtype first.
         x_for_quant = x_for_quant.to(torch.float16)
 
-    if _TRITON_AVAILABLE and x_for_quant.is_cuda:
+    if _TRITON_AVAILABLE and x_for_quant.is_cuda and x_for_quant.ndim == 2 and x_for_quant.shape[1] <= TRITON_ROWWISE_QUANT_MAX_COLS:
         try:
             return triton_quantize_rowwise(x_for_quant)
         except Exception:
@@ -177,10 +230,73 @@ def dequantize(q: Tensor, scale: float | Tensor) -> Tensor:
         scale = scale.to(q.device, non_blocking=True)
     return q.float() * scale
 
+def _normalize_runtime_backend(runtime_backend) -> str:
+    return runtime_backend if runtime_backend in INT8_BACKEND_CHOICES else DEFAULT_INT8_BACKEND
+
+def _normalize_small_batch_fallback(small_batch_fallback) -> str:
+    return small_batch_fallback if small_batch_fallback in SMALL_BATCH_FALLBACK_CHOICES else DEFAULT_SMALL_BATCH_FALLBACK
+
+def get_current_int8_runtime_config() -> dict:
+    return {
+        "runtime_backend": _normalize_runtime_backend(getattr(Int8TensorwiseOps, "runtime_backend", DEFAULT_INT8_BACKEND)),
+        "small_batch_fallback": _normalize_small_batch_fallback(getattr(Int8TensorwiseOps, "small_batch_fallback_mode", DEFAULT_SMALL_BATCH_FALLBACK)),
+        "prepack_int8_weights": bool(getattr(Int8TensorwiseOps, "prepack_int8_weights", False)),
+    }
+
+def configure_int8_module_runtime(
+    module,
+    small_batch_fallback=None,
+    runtime_backend=None,
+    prepack_int8_weights=None,
+):
+    runtime_backend = _normalize_runtime_backend(
+        runtime_backend if runtime_backend is not None else getattr(module, "_runtime_backend", DEFAULT_INT8_BACKEND)
+    )
+    small_batch_fallback = _normalize_small_batch_fallback(
+        small_batch_fallback if small_batch_fallback is not None else getattr(module, "_small_batch_fallback_mode", DEFAULT_SMALL_BATCH_FALLBACK)
+    )
+    prepack_int8_weights = (
+        bool(prepack_int8_weights)
+        if prepack_int8_weights is not None
+        else bool(getattr(module, "_prepack_int8_weights", False))
+    )
+
+    module._runtime_backend = runtime_backend
+    module._runtime_uses_triton = runtime_backend in (INT8_BACKEND_TRITON, INT8_BACKEND_TRITON_LEGACY_UNSAFE)
+    module._runtime_uses_legacy_triton = runtime_backend == INT8_BACKEND_TRITON_LEGACY_UNSAFE
+    module._small_batch_fallback_mode = small_batch_fallback
+    module._prepack_int8_weights = prepack_int8_weights
+    return module
+
 def _prepack_int8_weight(weight: Tensor | None):
     if not isinstance(weight, torch.Tensor) or weight.dtype != torch.int8 or weight.ndim != 2:
         return None
     return weight.detach().T.contiguous()
+
+def _prepack_torch_int_mm_weight(weight: Tensor | None):
+    if not isinstance(weight, torch.Tensor) or weight.dtype != torch.int8 or weight.ndim != 2:
+        return None
+
+    out_features = int(weight.shape[0])
+    in_features = int(weight.shape[1])
+    padded_out_features = out_features
+    padded_in_features = in_features
+
+    if padded_out_features % 8 != 0:
+        padded_out_features += 8 - (padded_out_features % 8)
+    if padded_in_features % 8 != 0:
+        padded_in_features += 8 - (padded_in_features % 8)
+
+    if padded_out_features == out_features and padded_in_features == in_features:
+        return None
+
+    padded_weight = torch.zeros(
+        (padded_out_features, padded_in_features),
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    padded_weight[:out_features, :in_features].copy_(weight.detach())
+    return padded_weight.T.contiguous()
 
 def _get_prepacked_weight(linear_module, device: torch.device):
     packed = getattr(linear_module, "weight_packed", None)
@@ -190,10 +306,17 @@ def _get_prepacked_weight(linear_module, device: torch.device):
         packed = packed.to(device, non_blocking=True)
     return packed
 
-def _torch_int_mm_safe(a: Tensor, b: Tensor) -> Tensor:
+def _get_torch_int_mm_weight(linear_module, weight: Tensor, device: torch.device):
+    packed = getattr(linear_module, "weight_int_mm", None)
+    if isinstance(packed, torch.Tensor):
+        return packed if packed.device == device else packed.to(device, non_blocking=True)
+    return weight.T
+
+def _torch_int_mm_safe(a: Tensor, b: Tensor, output_columns: int | None = None) -> Tensor:
     rows = int(a.shape[0])
-    columns = int(b.shape[1])
+    columns = int(output_columns) if output_columns is not None else int(b.shape[1])
     inner = int(a.shape[1])
+    b_inner = int(b.shape[0])
 
     if a.is_cuda and a.shape[0] <= 16:
         pad_rows = 17 - rows
@@ -201,17 +324,24 @@ def _torch_int_mm_safe(a: Tensor, b: Tensor) -> Tensor:
             padding = torch.zeros((pad_rows, a.shape[1]), device=a.device, dtype=a.dtype)
             a = torch.cat((a, padding), dim=0)
 
-    if a.is_cuda and inner > 0 and (inner % 8) != 0:
-        pad_inner = 8 - (inner % 8)
-        a_padding = torch.zeros((a.shape[0], pad_inner), device=a.device, dtype=a.dtype)
-        b_padding = torch.zeros((pad_inner, b.shape[1]), device=b.device, dtype=b.dtype)
-        a = torch.cat((a, a_padding), dim=1)
-        b = torch.cat((b, b_padding), dim=0)
+    if a.is_cuda and inner > 0:
+        target_inner = max(inner, b_inner)
+        if target_inner % 8 != 0:
+            target_inner += 8 - (target_inner % 8)
+        if int(a.shape[1]) < target_inner:
+            pad_inner = target_inner - int(a.shape[1])
+            padding = torch.zeros((a.shape[0], pad_inner), device=a.device, dtype=a.dtype)
+            a = torch.cat((a, padding), dim=1)
+        if int(b.shape[0]) < target_inner:
+            pad_inner = target_inner - int(b.shape[0])
+            padding = torch.zeros((pad_inner, b.shape[1]), device=b.device, dtype=b.dtype)
+            b = torch.cat((b, padding), dim=0)
 
     if b.is_cuda and (columns % 8) != 0:
-        pad_columns = 8 - (columns % 8)
-        padding = torch.zeros((b.shape[0], pad_columns), device=b.device, dtype=b.dtype)
-        b = torch.cat((b, padding), dim=1)
+        if int(b.shape[1]) < columns + (8 - (columns % 8)):
+            pad_columns = columns + (8 - (columns % 8)) - int(b.shape[1])
+            padding = torch.zeros((b.shape[0], pad_columns), device=b.device, dtype=b.dtype)
+            b = torch.cat((b, padding), dim=1)
 
     return torch._int_mm(a, b)[:rows, :columns]
 
@@ -255,12 +385,13 @@ def int8_forward_dynamic(
     compute_dtype: torch.dtype,
     use_triton: bool = True,
     weight_packed: Tensor | None = None,
+    weight_int_mm: Tensor | None = None,
     legacy_triton_unsafe: bool = False,
 ) -> Tensor:
     """Forward with dynamic per-token activation quantization."""
     
     # --- FAST PATH: Triton Fused Kernel ---
-    if _TRITON_AVAILABLE and use_triton and x.is_cuda:
+    if _TRITON_AVAILABLE and use_triton and x.is_cuda and x.shape[-1] <= TRITON_ROWWISE_QUANT_MAX_COLS:
         if isinstance(weight_packed, torch.Tensor):
             return triton_int8_linear(x, weight_packed, weight_scale, bias, compute_dtype, weight_is_prepacked=True, legacy_unsafe=legacy_triton_unsafe)
         return triton_int8_linear(x, weight, weight_scale, bias, compute_dtype, legacy_unsafe=legacy_triton_unsafe)
@@ -272,7 +403,8 @@ def int8_forward_dynamic(
         weight_scale = weight_scale.to(x.device, non_blocking=True)
     
     # INT8 Matmul (Outputs Int32)
-    res = _torch_int_mm_safe(x_8, weight.T)
+    matmul_weight = weight_int_mm if isinstance(weight_int_mm, torch.Tensor) else weight.T
+    res = _torch_int_mm_safe(x_8, matmul_weight, output_columns=weight.shape[0])
     
     # Dequantize: (res * weight_scale * x_scale)
     # Note: Creating intermediate Float tensors here is VRAM heavy
@@ -292,12 +424,13 @@ def int8_forward_dynamic_per_row(
     compute_dtype: torch.dtype,
     use_triton: bool = True,
     weight_packed: Tensor | None = None,
+    weight_int_mm: Tensor | None = None,
     legacy_triton_unsafe: bool = False,
 ) -> Tensor:
     """Forward with dynamic per-token activation quantization and per-row weight quantization."""
 
     # --- FAST PATH: Triton Fused Kernel (per-row) ---
-    if _TRITON_AVAILABLE and use_triton and x.is_cuda:
+    if _TRITON_AVAILABLE and use_triton and x.is_cuda and x.shape[-1] <= TRITON_ROWWISE_QUANT_MAX_COLS:
         if isinstance(weight_packed, torch.Tensor):
             return triton_int8_linear_per_row(x, weight_packed, weight_scale, bias, compute_dtype, weight_is_prepacked=True, legacy_unsafe=legacy_triton_unsafe)
         return triton_int8_linear_per_row(x, weight, weight_scale, bias, compute_dtype, legacy_unsafe=legacy_triton_unsafe)
@@ -308,7 +441,8 @@ def int8_forward_dynamic_per_row(
         weight_scale = weight_scale.to(x.device, non_blocking=True)
 
     # INT8 Matmul (Outputs Int32)
-    res = _torch_int_mm_safe(x_8, weight.T)
+    matmul_weight = weight_int_mm if isinstance(weight_int_mm, torch.Tensor) else weight.T
+    res = _torch_int_mm_safe(x_8, matmul_weight, output_columns=weight.shape[0])
 
     # Dequantize with per-row weight scales
     # res[i, j] = sum_k(x_8[i, k] * weight[j, k]) * x_scale[i] * weight_scale[j]
@@ -394,7 +528,9 @@ def _can_batch_dynamic_entries(prepared_entries, output_length: int | None):
     return True
 
 def _get_small_batch_fallback_threshold(linear_module) -> int:
-    mode = getattr(Int8TensorwiseOps, "small_batch_fallback_mode", SMALL_BATCH_FALLBACK_SMALL_LAYERS)
+    mode = getattr(linear_module, "_small_batch_fallback_mode", None)
+    if mode is None:
+        mode = getattr(Int8TensorwiseOps, "small_batch_fallback_mode", SMALL_BATCH_FALLBACK_SMALL_LAYERS)
     if mode not in SMALL_BATCH_FALLBACK_CHOICES:
         mode = SMALL_BATCH_FALLBACK_SMALL_LAYERS
     if mode == SMALL_BATCH_FALLBACK_NEVER:
@@ -1499,7 +1635,8 @@ if _COMFY_OPS_AVAILABLE:
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.register_buffer("weight_scale", None)
-                self.register_buffer("weight_packed", None)
+                self.register_buffer("weight_packed", None, persistent=False)
+                self.register_buffer("weight_int_mm", None, persistent=False)
                 self.register_buffer("quarot_hadamard", None)
                 self.register_buffer("hadanorm_sigma", None)
                 self._is_quantized = False
@@ -1511,6 +1648,12 @@ if _COMFY_OPS_AVAILABLE:
                 self.lora_A = None
                 self.lora_B = None
                 self.lora_alpha = None
+                configure_int8_module_runtime(
+                    self,
+                    small_batch_fallback=Int8TensorwiseOps.small_batch_fallback_mode,
+                    runtime_backend=Int8TensorwiseOps.runtime_backend,
+                    prepack_int8_weights=Int8TensorwiseOps.prepack_int8_weights,
+                )
             
             def reset_parameters(self):
                 return None
@@ -1541,7 +1684,8 @@ if _COMFY_OPS_AVAILABLE:
                         self.hadanorm_sigma = None
                         self._outlier_method = OUTLIER_METHOD_NONE
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
-                        self.weight_packed = _prepack_int8_weight(weight_tensor) if Int8TensorwiseOps.prepack_int8_weights else None
+                        self.weight_packed = _prepack_int8_weight(weight_tensor) if self._prepack_int8_weights else None
+                        self.weight_int_mm = _prepack_torch_int_mm_weight(weight_tensor)
                         Int8TensorwiseOps._is_prequantized = True # Found a quantized layer
                         
                         if isinstance(weight_scale, torch.Tensor):
@@ -1605,11 +1749,12 @@ if _COMFY_OPS_AVAILABLE:
                             self._outlier_method = OUTLIER_METHOD_NONE
                             self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                             self.weight_packed = None
+                            self.weight_int_mm = None
                             #print("Not quantizing", prefix)
                         else:
                             # Quantize on the fly (per-row, including FP8 -> INT8).
                             device = _get_int8_compute_device(weight_tensor.device)
-                            w_gpu = weight_tensor.to(device, non_blocking=True)
+                            w_gpu = tensor_to_int8_compute_device(weight_tensor, device, non_blocking=True)
                             outlier_method = _normalize_outlier_method(Int8TensorwiseOps.outlier_method)
                             if _is_float8_dtype(w_gpu.dtype):
                                 w_gpu = w_gpu.to(torch.float16 if device.type == "cuda" else torch.float32)
@@ -1646,7 +1791,8 @@ if _COMFY_OPS_AVAILABLE:
                             #print("Quantizing", prefix)
                             
                             self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
-                            self.weight_packed = _prepack_int8_weight(self.weight) if Int8TensorwiseOps.prepack_int8_weights else None
+                            self.weight_packed = _prepack_int8_weight(self.weight) if self._prepack_int8_weights else None
+                            self.weight_int_mm = _prepack_torch_int_mm_weight(self.weight)
                             self.weight_scale = (
                                 q_scale.cpu()
                                 if isinstance(q_scale, torch.Tensor)
@@ -1671,6 +1817,7 @@ if _COMFY_OPS_AVAILABLE:
                         self._outlier_method = OUTLIER_METHOD_NONE
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                         self.weight_packed = None
+                        self.weight_int_mm = None
                 else:
                     missing_keys.append(weight_key)
                 
@@ -1687,9 +1834,10 @@ if _COMFY_OPS_AVAILABLE:
                     self.weight = nn.Parameter(new_weight, requires_grad=False)
                 self.weight_packed = (
                     _prepack_int8_weight(self.weight)
-                    if self._is_quantized and Int8TensorwiseOps.prepack_int8_weights
+                    if self._is_quantized and self._prepack_int8_weights
                     else None
                 )
+                self.weight_int_mm = _prepack_torch_int_mm_weight(self.weight) if self._is_quantized else None
 
             def convert_weight(self, _weight, inplace=False):
                 if not self._is_quantized:
@@ -1779,11 +1927,18 @@ if _COMFY_OPS_AVAILABLE:
                 )
                 x_2d = x_transformed.reshape(-1, x_shape[-1])
 
-                use_triton = Int8TensorwiseOps.runtime_uses_triton
-                legacy_triton_unsafe = Int8TensorwiseOps.runtime_uses_legacy_triton
+                runtime_backend = _normalize_runtime_backend(getattr(self, "_runtime_backend", Int8TensorwiseOps.runtime_backend))
+                use_triton = bool(getattr(self, "_runtime_uses_triton", runtime_backend in (INT8_BACKEND_TRITON, INT8_BACKEND_TRITON_LEGACY_UNSAFE)))
+                legacy_triton_unsafe = bool(getattr(self, "_runtime_uses_legacy_triton", runtime_backend == INT8_BACKEND_TRITON_LEGACY_UNSAFE))
+                prepack_int8_weights = bool(getattr(self, "_prepack_int8_weights", Int8TensorwiseOps.prepack_int8_weights))
                 weight_packed = (
                     _get_prepacked_weight(self, x.device)
-                    if use_triton and Int8TensorwiseOps.prepack_int8_weights
+                    if use_triton and prepack_int8_weights
+                    else None
+                )
+                weight_int_mm = (
+                    _get_torch_int_mm_weight(self, weight, x.device)
+                    if not use_triton
                     else None
                 )
                 
@@ -1825,6 +1980,7 @@ if _COMFY_OPS_AVAILABLE:
                             compute_dtype,
                             use_triton=use_triton,
                             weight_packed=weight_packed,
+                            weight_int_mm=weight_int_mm,
                             legacy_triton_unsafe=legacy_triton_unsafe,
                         )
                     else:
@@ -1836,6 +1992,7 @@ if _COMFY_OPS_AVAILABLE:
                             compute_dtype,
                             use_triton=use_triton,
                             weight_packed=weight_packed,
+                            weight_int_mm=weight_int_mm,
                             legacy_triton_unsafe=legacy_triton_unsafe,
                         )
 

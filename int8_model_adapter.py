@@ -1,6 +1,7 @@
 import logging
 import os
 import uuid
+from contextlib import contextmanager
 
 import comfy.lora
 import comfy.model_management
@@ -23,15 +24,19 @@ from .int8_quant import (
 	_QUAROT_AVAILABLE,
 	_QUAROT_GROUP_SIZE,
 	_compute_hadanorm_sigma,
+	_prepack_torch_int_mm_weight,
 	_get_int8_compute_device,
 	_is_float8_dtype,
 	_quarot_build_hadamard,
 	_quarot_rotate_weight,
+	configure_int8_module_runtime,
 	quantize_int8_rowwise,
+	tensor_to_int8_compute_device,
 )
 from .int8_unet_loader import MODEL_TYPE_CHOICES as LOADER_MODEL_TYPE_CHOICES
 from .int8_unet_loader import MODEL_TYPE_FLUX2_FAST_UNSAFE
 from .int8_unet_loader import MODEL_TYPE_HIDREAM_O1
+from .int8_unet_loader import MODEL_TYPE_IDEOGRAM4
 from .int8_unet_loader import OUTLIER_METHOD_CHOICES
 from .int8_unet_loader import DEFAULT_OUTLIER_METHOD
 from .int8_unet_loader import get_model_type_exclusions
@@ -84,6 +89,10 @@ MODEL_TYPE_FINGERPRINTS = {
 		"language_model.layers",
 		"language_model.layers.35.mlp",
 	),
+	MODEL_TYPE_IDEOGRAM4: (
+		"embed_image_indicator",
+		"t_embedding",
+	),
 	"z-image": (
 		"cap_embedder",
 		"context_refiner",
@@ -132,6 +141,7 @@ MODEL_TYPE_FINGERPRINTS = {
 MODEL_TYPE_REQUIRED_MARKERS = {
 	"flux2": ("guidance_in", "double_stream_modulation_img", "double_stream_modulation_txt"),
 	MODEL_TYPE_HIDREAM_O1: ("language_model.layers",),
+	MODEL_TYPE_IDEOGRAM4: ("embed_image_indicator", "t_embedding"),
 	"z-image": ("cap_embedder", "context_refiner", "noise_refiner"),
 	"wan": ("patch_embedding", "time_projection"),
 	"ltx2": ("audio_adaln_single", "audio_caption_projection", "audio_patchify_proj"),
@@ -450,7 +460,7 @@ def _get_source_weight(model_patcher, module_name, module, bake_loaded_loras):
 
 def _quantize_linear_module(module_name, module, source_weight, outlier_method):
 	compute_device = _get_int8_compute_device(source_weight.device)
-	weight_work = source_weight.to(compute_device, non_blocking=True)
+	weight_work = tensor_to_int8_compute_device(source_weight, compute_device, non_blocking=True)
 	outlier_method = (outlier_method or OUTLIER_METHOD_NONE).strip().lower()
 	use_quarot = outlier_method == OUTLIER_METHOD_QUAROT
 
@@ -491,6 +501,7 @@ def _quantize_linear_module(module_name, module, source_weight, outlier_method):
 	)
 	q_module.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
 	q_module.weight_packed = q_module.weight.detach().T.contiguous() if Int8TensorwiseOps.prepack_int8_weights else None
+	q_module.weight_int_mm = _prepack_torch_int_mm_weight(q_module.weight)
 	q_module.weight_scale = (
 		q_scale.cpu()
 		if isinstance(q_scale, torch.Tensor)
@@ -507,6 +518,12 @@ def _quantize_linear_module(module_name, module, source_weight, outlier_method):
 	q_module.lora_A = None
 	q_module.lora_B = None
 	q_module.lora_alpha = None
+	configure_int8_module_runtime(
+		q_module,
+		small_batch_fallback=Int8TensorwiseOps.small_batch_fallback_mode,
+		runtime_backend=Int8TensorwiseOps.runtime_backend,
+		prepack_int8_weights=Int8TensorwiseOps.prepack_int8_weights,
+	)
 
 	if module.bias is not None:
 		q_module.bias = nn.Parameter(module.bias.detach().cpu(), requires_grad=False)
@@ -552,6 +569,38 @@ def _is_first_sampling_step(transformer_options):
 	return abs(current_sigma - start_sigma) <= max(1e-6, abs(start_sigma) * 1e-6)
 
 
+@contextmanager
+def _temporary_anima_text_id_dtype_guard(diffusion_model, adapter_state):
+	if not isinstance(adapter_state, dict) or adapter_state.get("model_type") != "anima":
+		yield
+		return
+	if diffusion_model is None:
+		yield
+		return
+
+	preprocess_text_embeds = getattr(diffusion_model, "preprocess_text_embeds", None)
+	if not callable(preprocess_text_embeds):
+		yield
+		return
+
+	def guarded_preprocess_text_embeds(text_embeds, text_ids, *args, **kwargs):
+		if isinstance(text_ids, torch.Tensor) and text_ids.dtype not in (torch.int, torch.long):
+			raise RuntimeError(
+				"INT8 Model Adapter: Anima text ids arrived with dtype "
+				f"{text_ids.dtype}, but Anima requires integer token ids for its embedding layer. "
+				"This is usually caused by a conditioning node applying math to the entire conditioning "
+				"payload, including t5xxl_ids. RES4LYF ConditioningMultiply is known to do this. Remove "
+				"that node for Anima or use conditioning math that leaves token-id tensors unchanged."
+			)
+		return preprocess_text_embeds(text_embeds, text_ids, *args, **kwargs)
+
+	diffusion_model.preprocess_text_embeds = guarded_preprocess_text_embeds
+	try:
+		yield
+	finally:
+		diffusion_model.preprocess_text_embeds = preprocess_text_embeds
+
+
 def _int8_model_adapter_notice_wrapper(executor, *args, **kwargs):
 	transformer_options = _extract_transformer_options(args, kwargs)
 	adapter_state = transformer_options.get("int8_model_adapter", None)
@@ -587,7 +636,8 @@ def _int8_model_adapter_notice_wrapper(executor, *args, **kwargs):
 		else:
 			diffusion_model._int8_model_adapter_notice_in_generation = False
 
-	result = executor(*args, **kwargs)
+	with _temporary_anima_text_id_dtype_guard(diffusion_model, adapter_state):
+		result = executor(*args, **kwargs)
 	if isinstance(adapter_state, dict):
 		Int8TensorwiseOps.print_runtime_stats()
 	return result
@@ -678,7 +728,20 @@ def _normalize_small_batch_fallback(small_batch_fallback):
 	return small_batch_fallback if small_batch_fallback in SMALL_BATCH_FALLBACK_CHOICES else DEFAULT_SMALL_BATCH_FALLBACK
 
 
-def _get_current_int8_runtime_settings():
+def _get_current_int8_runtime_settings(existing_modules=None):
+	if existing_modules:
+		for _module_name, module in existing_modules:
+			if not isinstance(module, Int8TensorwiseOps.Linear):
+				continue
+			return (
+				_normalize_small_batch_fallback(
+					getattr(module, "_small_batch_fallback_mode", DEFAULT_SMALL_BATCH_FALLBACK)
+				),
+				_normalize_runtime_backend(
+					getattr(module, "_runtime_backend", DEFAULT_INT8_BACKEND)
+				),
+				bool(getattr(module, "_prepack_int8_weights", False)),
+			)
 	return (
 		_normalize_small_batch_fallback(
 			getattr(Int8TensorwiseOps, "small_batch_fallback_mode", DEFAULT_SMALL_BATCH_FALLBACK)
@@ -819,9 +882,10 @@ def _set_existing_int8_weight(q_module, new_weight):
 		q_module.weight = nn.Parameter(new_weight, requires_grad=False)
 		q_module.weight_packed = (
 			q_module.weight.detach().T.contiguous()
-			if Int8TensorwiseOps.prepack_int8_weights
+			if getattr(q_module, "_prepack_int8_weights", Int8TensorwiseOps.prepack_int8_weights)
 			else None
 		)
+		q_module.weight_int_mm = _prepack_torch_int_mm_weight(q_module.weight)
 
 
 def _clone_existing_int8_module(q_module):
@@ -839,9 +903,10 @@ def _clone_existing_int8_module(q_module):
 	)
 	cloned_module.weight_packed = (
 		cloned_module.weight.detach().T.contiguous()
-		if Int8TensorwiseOps.prepack_int8_weights
+		if getattr(q_module, "_prepack_int8_weights", Int8TensorwiseOps.prepack_int8_weights)
 		else None
 	)
+	cloned_module.weight_int_mm = _prepack_torch_int_mm_weight(cloned_module.weight)
 	cloned_module.quarot_hadamard = (
 		q_module.quarot_hadamard.detach().clone()
 		if isinstance(q_module.quarot_hadamard, torch.Tensor)
@@ -861,6 +926,12 @@ def _clone_existing_int8_module(q_module):
 	cloned_module.lora_A = None
 	cloned_module.lora_B = None
 	cloned_module.lora_alpha = None
+	configure_int8_module_runtime(
+		cloned_module,
+		small_batch_fallback=getattr(q_module, "_small_batch_fallback_mode", Int8TensorwiseOps.small_batch_fallback_mode),
+		runtime_backend=getattr(q_module, "_runtime_backend", Int8TensorwiseOps.runtime_backend),
+		prepack_int8_weights=getattr(q_module, "_prepack_int8_weights", Int8TensorwiseOps.prepack_int8_weights),
+	)
 
 	if q_module.bias is not None:
 		cloned_module.bias = nn.Parameter(q_module.bias.detach().clone(), requires_grad=False)
@@ -1080,9 +1151,9 @@ class INT8ModelAdapter:
 		fast_unsafe_targeting = resolved_model_type == MODEL_TYPE_FLUX2_FAST_UNSAFE
 		small_batch_fallback = _normalize_small_batch_fallback(small_batch_fallback)
 		runtime_backend = _normalize_runtime_backend(runtime_backend)
-		prior_small_batch_fallback, prior_runtime_backend, prior_prepack_int8_weights = _get_current_int8_runtime_settings()
 
 		source_existing_int8_modules = _collect_existing_int8_modules(source_diffusion_model, excluded_names)
+		prior_small_batch_fallback, prior_runtime_backend, prior_prepack_int8_weights = _get_current_int8_runtime_settings(source_existing_int8_modules)
 		source_has_quantizable_candidates = bool(_collect_int8_candidates(
 			source_diffusion_model,
 			excluded_names,

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from contextlib import contextmanager
 
 import comfy.sd
 import comfy.utils
@@ -68,6 +69,27 @@ def _module_has_non_float_weight(module):
 	if weight.is_floating_point() or weight.is_complex():
 		return False
 	return True
+
+
+def _resolve_source_metadata(model_patcher):
+	seen_patcher_ids = set()
+	current_patcher = model_patcher
+
+	while current_patcher is not None and id(current_patcher) not in seen_patcher_ids:
+		seen_patcher_ids.add(id(current_patcher))
+
+		metadata = getattr(current_patcher, "_safetensors_metadata", None)
+		if isinstance(metadata, dict) and metadata:
+			return dict(metadata)
+
+		inner_model = getattr(current_patcher, "model", None)
+		metadata = getattr(inner_model, "_int8_source_metadata", None)
+		if isinstance(metadata, dict) and metadata:
+			return dict(metadata)
+
+		current_patcher = getattr(current_patcher, "parent", None)
+
+	return None
 
 
 def _resolve_patch_target_module(base_model, patch_key):
@@ -163,6 +185,21 @@ def _restore_comfy_patched_weights_flag(flag_states):
 			delattr(module, "comfy_patched_weights")
 
 
+@contextmanager
+def _temporary_save_compatibility_shim(modules):
+	flag_states = _set_comfy_patched_weights_flag(modules)
+	restore_lazy_param = _install_lazy_casting_param_workaround()
+	if restore_lazy_param is not None:
+		print("[INT8 Model Save] Enabled temporary LazyCastingParam requires_grad workaround.")
+
+	try:
+		yield
+	finally:
+		if restore_lazy_param is not None:
+			restore_lazy_param()
+		_restore_comfy_patched_weights_flag(flag_states)
+
+
 def _apply_object_patches_for_save(model_patcher):
 	object_patches = getattr(model_patcher, "object_patches", None)
 	if not isinstance(object_patches, dict) or not object_patches:
@@ -248,7 +285,7 @@ class INT8ModelSave:
 			prompt_info = json.dumps(prompt)
 
 		metadata = {}
-		source_metadata = getattr(model, "_safetensors_metadata", None)
+		source_metadata = _resolve_source_metadata(model)
 		if isinstance(source_metadata, dict):
 			metadata.update(source_metadata)
 		if not args.disable_metadata:
@@ -273,17 +310,8 @@ class INT8ModelSave:
 			logging.warning("INT8 Model Save: no target modules were found for DynamicVRAM save workaround.")
 		else:
 			print(f"[INT8 Model Save] Applying DynamicVRAM save workaround on {len(modules_to_patch)} module(s).")
-		flag_states = _set_comfy_patched_weights_flag(modules_to_patch)
-		restore_lazy_param = _install_lazy_casting_param_workaround()
-		if restore_lazy_param is not None:
-			print("[INT8 Model Save] Enabled temporary LazyCastingParam requires_grad workaround.")
-
-		try:
+		with _temporary_save_compatibility_shim(modules_to_patch):
 			comfy.sd.save_checkpoint(output_checkpoint, model, metadata=metadata)
-		finally:
-			if restore_lazy_param is not None:
-				restore_lazy_param()
-			_restore_comfy_patched_weights_flag(flag_states)
 
 		_summarize_saved_int8_checkpoint(output_checkpoint)
 

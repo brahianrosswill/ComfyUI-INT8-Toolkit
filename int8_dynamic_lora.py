@@ -3,22 +3,14 @@ import comfy.utils
 import comfy.lora
 import comfy.patcher_extension
 import logging
-import torch
 import uuid
 
-try:
-    from comfy.weight_adapter.lora import LoRAAdapter
-    _LORA_ADAPTER_AVAILABLE = True
-except Exception:
-    LoRAAdapter = None
-    _LORA_ADAPTER_AVAILABLE = False
-
-try:
-    from comfy.weight_adapter.base import WeightAdapterBase
-    _WEIGHT_ADAPTER_BASE_AVAILABLE = True
-except Exception:
-    WeightAdapterBase = None
-    _WEIGHT_ADAPTER_BASE_AVAILABLE = False
+from .int8_lora_patching import (
+    LoRAAdapter,
+    _LORA_ADAPTER_AVAILABLE,
+    _get_key_map,
+    _wrap_static_int8_patches,
+)
 
 _DYNAMIC_LORA_WRAPPER_KEY = "int8_dynamic_lora_sync"
 
@@ -35,85 +27,6 @@ def _is_dynamic_compatible_adapter(adapter):
     reshape = weights[5] if len(weights) > 5 else None
     return dora_scale is None and reshape is None
 
-
-def _is_weight_adapter(adapter):
-    return _WEIGHT_ADAPTER_BASE_AVAILABLE and isinstance(adapter, WeightAdapterBase)
-
-
-def _resolve_target_module(model_patcher, key, module_cache=None):
-    layer_name = key[0] if isinstance(key, tuple) else key
-    if isinstance(layer_name, str) and layer_name.endswith(".weight"):
-        layer_name = layer_name[:-7]
-
-    if module_cache is not None and layer_name in module_cache:
-        return module_cache[layer_name]
-
-    try:
-        target_module = model_patcher.get_model_object(layer_name)
-        if module_cache is not None:
-            module_cache[layer_name] = target_module
-        return target_module
-    except Exception:
-        pass
-
-    parts = layer_name.split(".")
-    target_module = model_patcher.model.diffusion_model
-    for part in parts[1:] if parts and parts[0] == "diffusion_model" else parts:
-        if part.isdigit():
-            target_module = target_module[int(part)]
-        else:
-            target_module = getattr(target_module, part)
-
-    if module_cache is not None:
-        module_cache[layer_name] = target_module
-    return target_module
-
-
-def _wrap_static_int8_patches(model_patcher, patch_dict, seed=318008, module_cache=None):
-    from .int8_quant import INT8LoRAPatchAdapter, INT8WeightPatchAdapter
-
-    if module_cache is None:
-        module_cache = {}
-
-    wrapped_patch_dict = {}
-    for key, adapter in patch_dict.items():
-        if not _is_weight_adapter(adapter):
-            wrapped_patch_dict[key] = adapter
-            continue
-
-        try:
-            target_module = _resolve_target_module(model_patcher, key, module_cache)
-            if not (hasattr(target_module, "_is_quantized") and target_module._is_quantized):
-                wrapped_patch_dict[key] = adapter
-                continue
-
-            w_scale = target_module.weight_scale
-            if isinstance(w_scale, torch.Tensor):
-                w_scale = w_scale.item() if w_scale.numel() == 1 else w_scale
-            outlier_method = getattr(target_module, "_outlier_method", None)
-            hadanorm_sigma = getattr(target_module, "hadanorm_sigma", None)
-
-            if _LORA_ADAPTER_AVAILABLE and isinstance(adapter, LoRAAdapter):
-                wrapped_patch_dict[key] = INT8LoRAPatchAdapter(
-                    adapter.loaded_keys,
-                    adapter.weights,
-                    w_scale,
-                    seed=seed,
-                    outlier_method=outlier_method,
-                    hadanorm_sigma=hadanorm_sigma,
-                )
-            else:
-                wrapped_patch_dict[key] = INT8WeightPatchAdapter(
-                    adapter,
-                    w_scale,
-                    seed=seed,
-                    outlier_method=outlier_method,
-                    hadanorm_sigma=hadanorm_sigma,
-                )
-        except Exception:
-            wrapped_patch_dict[key] = adapter
-
-    return wrapped_patch_dict
 
 def _dynamic_lora_sync_wrapper(executor, *args, **kwargs):
     transformer_options = kwargs.get("transformer_options", None)
@@ -163,9 +76,7 @@ class INT8DynamicLoraLoader:
         model_patcher = model.clone()
         
         # 1. Get Patch Map
-        key_map = {}
-        if model_patcher.model.model_type.name != "ModelType.CLIP":
-            key_map = comfy.lora.model_lora_keys_unet(model_patcher.model, key_map)
+        key_map = _get_key_map(model_patcher)
 
         patch_dict = comfy.lora.load_lora(lora, key_map, log_missing=True)
         del lora
@@ -243,9 +154,7 @@ class INT8DynamicLoraStack:
 
         model_patcher = model.clone()
 
-        key_map = {}
-        if model_patcher.model.model_type.name != "ModelType.CLIP":
-            key_map = comfy.lora.model_lora_keys_unet(model_patcher.model, key_map)
+        key_map = _get_key_map(model_patcher)
 
         from .int8_quant import DynamicLoRAHook
         DynamicLoRAHook.register(model_patcher.model.diffusion_model)

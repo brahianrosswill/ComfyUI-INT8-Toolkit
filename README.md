@@ -87,6 +87,7 @@ Supported `model_type` presets:
 - `flux2`
 - `flux2_fast_unsafe`
 - `hidream o1`
+- `ideogram4`
 - `ltx2`
 - `qwen`
 - `sdxl`
@@ -146,6 +147,7 @@ Environment variables:
 - `INT8_TRITON_GROUP_SIZE_M`
 - `INT8_TRITON_NUM_WARPS`
 - `INT8_TRITON_NUM_STAGES`
+- `INT8_TRITON_ROWWISE_QUANT_MAX_COLS`
 - `INT8_SMALL_BATCH_FALLBACK_MAX_ROWS`
 - `INT8_SMALL_BATCH_FALLBACK_MIN_ROWS`
 - `INT8_SMALL_LAYER_MAX_PARAMS`
@@ -155,8 +157,11 @@ Environment variables:
 - `INT8_DYNAMIC_LORA_BATCH`
 - `INT8_DYNAMIC_LORA_BATCH_MAX_RANK`
 - `INT8_FORCE_DISABLE_TORCH_COMPILE`
+- `INT8_FILE_SLICE_LOAD`
 
 Keep `INT8_RUNTIME_STATS=0` for normal use. Runtime stats are useful for backend diagnosis but add console work and should not be used for performance benchmarking.
+`INT8_FILE_SLICE_LOAD=1` is the default. Set it to `0` to disable the optional Comfy/AIMDO file-slice transfer path used while moving CPU source weights to the CUDA work device for INT8 quantization.
+`INT8_TRITON_ROWWISE_QUANT_MAX_COLS` defaults to `8192`. Wider activation rows fall back to the PyTorch INT8 backend instead of trying the single-block Triton rowwise quantizer.
 
 ## LoRA Order And VRAM Behavior
 

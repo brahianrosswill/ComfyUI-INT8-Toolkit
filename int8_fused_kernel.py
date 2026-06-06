@@ -21,6 +21,7 @@ def _read_env_int(name: str, default_value: int) -> int:
 
 
 _ENABLE_TRITON_AUTOTUNE = os.environ.get("INT8_TRITON_AUTOTUNE", "0") == "1"
+TRITON_ROWWISE_QUANT_MAX_COLS = max(128, _read_env_int("INT8_TRITON_ROWWISE_QUANT_MAX_COLS", 8192))
 
 _FIXED_KERNEL_CONFIG = {
 	"BLOCK_M": max(16, _read_env_int("INT8_TRITON_BLOCK_M", 128)),
@@ -280,6 +281,10 @@ def triton_quantize_rowwise(x: torch.Tensor):
 		x = x.contiguous()
 
 	rows, cols = x.shape
+	if cols > TRITON_ROWWISE_QUANT_MAX_COLS:
+		raise RuntimeError(
+			f"Triton rowwise quantization only supports <= {TRITON_ROWWISE_QUANT_MAX_COLS} columns; got {cols}."
+		)
 	y = torch.empty_like(x, dtype=torch.int8)
 	s = torch.empty((rows, 1), device=x.device, dtype=torch.float32)
 

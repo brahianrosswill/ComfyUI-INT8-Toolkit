@@ -17,6 +17,7 @@ from .int8_quant import (
 MODEL_TYPE_FLUX2 = "flux2"
 MODEL_TYPE_FLUX2_FAST_UNSAFE = "flux2_fast_unsafe"
 MODEL_TYPE_HIDREAM_O1 = "hidream o1"
+MODEL_TYPE_IDEOGRAM4 = "ideogram4"
 MODEL_TYPE_CHOICES = [
     "anima",
     "chroma",
@@ -24,6 +25,7 @@ MODEL_TYPE_CHOICES = [
     MODEL_TYPE_FLUX2,
     MODEL_TYPE_FLUX2_FAST_UNSAFE,
     MODEL_TYPE_HIDREAM_O1,
+    MODEL_TYPE_IDEOGRAM4,
     "ltx2",
     "qwen",
     "sdxl",
@@ -73,6 +75,10 @@ def get_model_type_exclusions(model_type):
         return [
             "embed", "language_model.layers.35.mlp",
         ]
+    if model_type == MODEL_TYPE_IDEOGRAM4:
+        return [
+            "embed_image_indicator", "t_embedding",
+        ]
     if model_type == "sdxl":
         return [
             "time_embed", "label_emb", "emb_layers", "proj_in", "proj_out",
@@ -101,6 +107,26 @@ def _read_safetensors_metadata(path):
             return dict(metadata) if isinstance(metadata, dict) else None
     except Exception:
         return None
+
+
+def _stash_safetensors_metadata(model, metadata):
+    if not isinstance(metadata, dict):
+        return
+
+    metadata = dict(metadata)
+    try:
+        model._safetensors_metadata = metadata
+    except Exception:
+        pass
+
+    inner_model = getattr(model, "model", None)
+    if inner_model is None:
+        return
+
+    try:
+        inner_model._int8_source_metadata = metadata
+    except Exception:
+        pass
 
 
 class UNetLoaderINTW8A8:
@@ -181,7 +207,7 @@ class UNetLoaderINTW8A8:
         model = load_diffusion_model(unet_path, model_options=model_options)
         metadata = _read_safetensors_metadata(unet_path)
         if metadata is not None:
-            model._safetensors_metadata = metadata
+            _stash_safetensors_metadata(model, metadata)
 
         if on_the_fly_quantization:
             Int8TensorwiseOps.summarize_otf_progress()
