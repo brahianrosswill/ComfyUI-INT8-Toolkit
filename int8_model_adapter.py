@@ -1318,6 +1318,23 @@ class INT8ModelAdapter:
 			model_patcher.patches_uuid = uuid.uuid4()
 		_cleanup_torch_memory()
 
+		if quantized == 0 and existing_quantized == 0 and skipped_patched_count > 0:
+			if total > 0 and skipped_patched_count == total:
+				logging.warning(
+					"INT8 Model Adapter: all eligible layers had pending patches and bake_loaded_loras is disabled; "
+					"no layers were quantized. Enable bake_loaded_loras or remove upstream merge/LoRA patches."
+				)
+			else:
+				logging.warning(
+					f"INT8 Model Adapter: {skipped_patched_count} eligible layer(s) had pending patches and "
+					"bake_loaded_loras is disabled; no layers were quantized. Enable bake_loaded_loras or remove "
+					"upstream merge/LoRA patches."
+				)
+			logging.warning(
+				"INT8 Model Adapter: This MODEL output is not INT8-converted; later dtype/runtime errors are likely "
+				"outside the INT8 forward path."
+			)
+
 		if log_progress:
 			print(
 				"[INT8 Model Adapter] Complete "
@@ -1325,7 +1342,8 @@ class INT8ModelAdapter:
 				f"baked_patches={baked_lora_count}, configured_int8_patches={configured_int8_patch_count}, "
 				f"skipped_patched_layers={skipped_patched_count}, outlier_adjusted={quarot_count}, "
 				f"backend={effective_runtime_backend}, small_batch_fallback={effective_small_batch_fallback}, "
-				f"prepack_int8_weights={bool(effective_prepack_int8_weights)})"
+				f"prepack_int8_weights={bool(effective_prepack_int8_weights)}, "
+				f"bake_loaded_loras={bool(bake_loaded_loras)})"
 			)
 			if compile_wrapper_removed:
 				print("[INT8 Model Adapter] Removed torch.compile wrapper after requantization.")

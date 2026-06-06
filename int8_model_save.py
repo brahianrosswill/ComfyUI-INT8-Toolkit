@@ -163,6 +163,57 @@ def _restore_comfy_patched_weights_flag(flag_states):
 			delattr(module, "comfy_patched_weights")
 
 
+def _apply_object_patches_for_save(model_patcher):
+	object_patches = getattr(model_patcher, "object_patches", None)
+	if not isinstance(object_patches, dict) or not object_patches:
+		return False
+
+	patch_model = getattr(model_patcher, "patch_model", None)
+	if not callable(patch_model):
+		return False
+
+	try:
+		patch_model(load_weights=False)
+		return True
+	except Exception as e:
+		logging.warning(f"INT8 Model Save: failed to apply object patches before save ({e}).")
+		return False
+
+
+def _summarize_saved_int8_checkpoint(path):
+	try:
+		from safetensors import safe_open
+	except Exception:
+		return
+
+	try:
+		dtype_counts = {}
+		int8_weights = 0
+		total_weights = 0
+		weight_scales = 0
+		with safe_open(path, framework="pt", device="cpu") as handle:
+			for key in handle.keys():
+				tensor_slice = handle.get_slice(key)
+				dtype = tensor_slice.get_dtype()
+				dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
+				if key.endswith(".weight"):
+					total_weights += 1
+					if dtype == "I8":
+						int8_weights += 1
+				elif key.endswith(".weight_scale"):
+					weight_scales += 1
+
+		print(
+			"[INT8 Model Save] Saved checkpoint summary "
+			f"(int8_weights={int8_weights}, weight_scales={weight_scales}, "
+			f"total_weights={total_weights}, dtypes={dtype_counts})."
+		)
+		if int8_weights == 0 or weight_scales == 0:
+			logging.warning("INT8 Model Save: saved checkpoint does not appear to contain INT8 weights.")
+	except Exception as e:
+		logging.warning(f"INT8 Model Save: failed to inspect saved checkpoint ({e}).")
+
+
 class INT8ModelSave:
 	def __init__(self):
 		self.output_dir = folder_paths.get_output_directory()
@@ -213,6 +264,10 @@ class INT8ModelSave:
 		if callable(finalize_pending_int8):
 			finalize_pending_int8()
 
+		applied_object_patches = _apply_object_patches_for_save(model)
+		if applied_object_patches:
+			print("[INT8 Model Save] Applied object patches before saving INT8 modules.")
+
 		modules_to_patch = _collect_modules_for_save_workaround(model)
 		if not modules_to_patch:
 			logging.warning("INT8 Model Save: no target modules were found for DynamicVRAM save workaround.")
@@ -229,5 +284,7 @@ class INT8ModelSave:
 			if restore_lazy_param is not None:
 				restore_lazy_param()
 			_restore_comfy_patched_weights_flag(flag_states)
+
+		_summarize_saved_int8_checkpoint(output_checkpoint)
 
 		return {}
