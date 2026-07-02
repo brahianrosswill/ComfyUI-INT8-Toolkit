@@ -21,22 +21,24 @@ from .int8_quant import (
 	INT8_BACKEND_TRITON_LEGACY_UNSAFE,
 	SMALL_BATCH_FALLBACK_CHOICES,
 	DEFAULT_SMALL_BATCH_FALLBACK,
-	_QUAROT_AVAILABLE,
-	_QUAROT_GROUP_SIZE,
+	_build_outlier_hadamard,
 	_compute_hadanorm_sigma,
+	_get_outlier_group_size,
 	_prepack_torch_int_mm_weight,
 	_get_int8_compute_device,
 	_is_float8_dtype,
-	_quarot_build_hadamard,
-	_quarot_rotate_weight,
+	_outlier_method_uses_hadamard,
+	_rotate_weight_for_outlier_method,
 	configure_int8_module_runtime,
 	quantize_int8_rowwise,
 	tensor_to_int8_compute_device,
 )
 from .int8_unet_loader import MODEL_TYPE_CHOICES as LOADER_MODEL_TYPE_CHOICES
+from .int8_unet_loader import MODEL_TYPE_BOOGU
 from .int8_unet_loader import MODEL_TYPE_FLUX2_FAST_UNSAFE
 from .int8_unet_loader import MODEL_TYPE_HIDREAM_O1
 from .int8_unet_loader import MODEL_TYPE_IDEOGRAM4
+from .int8_unet_loader import MODEL_TYPE_KREA2
 from .int8_unet_loader import OUTLIER_METHOD_CHOICES
 from .int8_unet_loader import DEFAULT_OUTLIER_METHOD
 from .int8_unet_loader import get_model_type_exclusions
@@ -93,6 +95,14 @@ MODEL_TYPE_FINGERPRINTS = {
 		"embed_image_indicator",
 		"t_embedding",
 	),
+	MODEL_TYPE_KREA2: (
+		"first",
+		"last",
+		"tmlp",
+		"tproj",
+		"txtfusion",
+		"txtmlp",
+	),
 	"z-image": (
 		"cap_embedder",
 		"context_refiner",
@@ -105,6 +115,15 @@ MODEL_TYPE_FINGERPRINTS = {
 		"nerf_image_embedder",
 		"nerf_blocks",
 		"nerf_final_layer_conv",
+	),
+	MODEL_TYPE_BOOGU: (
+		"double_stream_layers",
+		"img_instruct_attn",
+		"ref_image_patch_embedder",
+		"noise_refiner",
+		"ref_image_refiner",
+		"context_refiner",
+		"norm_out",
 	),
 	"wan": (
 		"patch_embedding",
@@ -140,8 +159,10 @@ MODEL_TYPE_FINGERPRINTS = {
 
 MODEL_TYPE_REQUIRED_MARKERS = {
 	"flux2": ("guidance_in", "double_stream_modulation_img", "double_stream_modulation_txt"),
+	MODEL_TYPE_BOOGU: ("double_stream_layers", "img_instruct_attn", "ref_image_patch_embedder"),
 	MODEL_TYPE_HIDREAM_O1: ("language_model.layers",),
 	MODEL_TYPE_IDEOGRAM4: ("embed_image_indicator", "t_embedding"),
+	MODEL_TYPE_KREA2: ("txtfusion", "tmlp", "tproj"),
 	"z-image": ("cap_embedder", "context_refiner", "noise_refiner"),
 	"wan": ("patch_embedding", "time_projection"),
 	"ltx2": ("audio_adaln_single", "audio_caption_projection", "audio_patchify_proj"),
@@ -463,6 +484,7 @@ def _quantize_linear_module(module_name, module, source_weight, outlier_method):
 	weight_work = tensor_to_int8_compute_device(source_weight, compute_device, non_blocking=True)
 	outlier_method = (outlier_method or OUTLIER_METHOD_NONE).strip().lower()
 	use_quarot = outlier_method == OUTLIER_METHOD_QUAROT
+	group_size = _get_outlier_group_size(outlier_method)
 
 	if _is_float8_dtype(weight_work.dtype):
 		weight_work = weight_work.to(torch.float16 if compute_device.type == "cuda" else torch.float32)
@@ -472,17 +494,18 @@ def _quantize_linear_module(module_name, module, source_weight, outlier_method):
 	quarot_hadamard = None
 	hadanorm_sigma = None
 	if (
-		outlier_method != OUTLIER_METHOD_NONE
-		and _QUAROT_AVAILABLE
+		_outlier_method_uses_hadamard(outlier_method)
 		and weight_work.ndim == 2
-		and weight_work.shape[1] % _QUAROT_GROUP_SIZE == 0
+		and weight_work.shape[1] % group_size == 0
 	):
 		try:
-			h_matrix = _quarot_build_hadamard(_QUAROT_GROUP_SIZE, device=compute_device, dtype=weight_work.dtype)
+			h_matrix = _build_outlier_hadamard(outlier_method, group_size, device=compute_device, dtype=weight_work.dtype)
+			if h_matrix is None:
+				raise RuntimeError(f"{outlier_method} Hadamard helper is unavailable")
 			if outlier_method == OUTLIER_METHOD_HADANORM:
 				hadanorm_sigma = _compute_hadanorm_sigma(weight_work).to(device=compute_device, dtype=weight_work.dtype)
 				weight_work = weight_work * hadanorm_sigma.view(1, -1)
-			weight_work = _quarot_rotate_weight(weight_work, h_matrix, group_size=_QUAROT_GROUP_SIZE)
+			weight_work = _rotate_weight_for_outlier_method(weight_work, h_matrix, group_size=group_size, method=outlier_method)
 			quarot_hadamard = h_matrix.detach().cpu()
 		except Exception as e:
 			logging.warning(f"INT8 Model Adapter: {outlier_method} skipped for {module_name} ({e}).")
@@ -1107,7 +1130,7 @@ class INT8ModelAdapter:
 				"model": ("MODEL", {"tooltip": "The stock-loaded diffusion model to convert to this extension's INT8 linear runtime."}),
 				"enable_int8": ("BOOLEAN", {"default": True, "tooltip": "Disable this to pass the input model through unchanged without removing the node from a workflow."}),
 				"model_type": (MODEL_TYPE_CHOICES, {"default": AUTO_MODEL_TYPE, "tooltip": "Architecture preset used to skip layers that are usually quality-sensitive or unsafe to quantize. Auto inspects the loaded MODEL. flux2_fast_unsafe is opt-in and uses less defensive targeting. Use none only for experiments."}),
-				"outlier_method": (OUTLIER_METHOD_CHOICES, {"default": DEFAULT_OUTLIER_METHOD, "tooltip": "Outlier mitigation to apply before quantizing compatible layers. QuaRot uses a Hadamard rotation. HadaNorm adds per-channel scaling, Hadamard mixing, and a runtime correction term for compatible layers."}),
+				"outlier_method": (OUTLIER_METHOD_CHOICES, {"default": DEFAULT_OUTLIER_METHOD, "tooltip": "Outlier mitigation to apply before quantizing compatible layers. ConvRot uses regular Hadamard rotation and can export native Comfy metadata. QuaRot uses this toolkit's legacy Hadamard rotation. HadaNorm adds per-channel scaling, Hadamard mixing, and a runtime correction term for compatible layers."}),
 				"small_batch_fallback": (SMALL_BATCH_FALLBACK_CHOICES, {"default": DEFAULT_SMALL_BATCH_FALLBACK, "tooltip": "Controls the fp16/bf16 fallback for very small activation batches. only_small_layers is the default and limits fallback to layers with out_features * in_features <= INT8_SMALL_LAYER_MAX_PARAMS, default 1,000,000; always can help tiny row counts but often slows larger layers by dequantizing full weights; never forces the INT8 backend."}),
 				"runtime_backend": (INT8_BACKEND_CHOICES, {"default": DEFAULT_INT8_BACKEND, "tooltip": "Backend for INT8 linear layers. torch_int_mm is the default and uses PyTorch torch._int_mm with tiny-row padding for CUDA compatibility; triton uses this extension's fused Triton kernels and may be faster on some model shapes; triton_legacy_unsafe reproduces the old upstream edge-tile behavior for diagnostics only and may be incorrect on tail shapes."}),
 				"prepack_int8_weights": ("BOOLEAN", {"default": False, "tooltip": "Experimental: keep an extra transposed INT8 weight buffer for Triton so output columns are read contiguously. May improve speed but adds roughly one extra INT8 copy of each quantized weight."}),

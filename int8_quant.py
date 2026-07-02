@@ -1,6 +1,7 @@
-import torch
 import os
 import logging
+import json
+import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 import comfy.model_management
@@ -41,6 +42,13 @@ try:
     _QUAROT_AVAILABLE = True
 except Exception:
     _QUAROT_AVAILABLE = False
+
+try:
+    from .convrot import build_hadamard as _convrot_build_hadamard
+    from .convrot import rotate_weight as _convrot_rotate_weight
+    _CONVROT_AVAILABLE = True
+except Exception:
+    _CONVROT_AVAILABLE = False
 
 if _INT8_FORCE_DISABLE_TORCH_COMPILE:
     try:
@@ -95,9 +103,16 @@ INT8_BACKEND_CHOICES = [
 DEFAULT_INT8_BACKEND = INT8_BACKEND_TORCH_INT_MM
 OUTLIER_METHOD_NONE = "none"
 OUTLIER_METHOD_QUAROT = "quarot"
+OUTLIER_METHOD_CONVROT = "convrot"
 OUTLIER_METHOD_HADANORM = "hadanorm"
-OUTLIER_METHOD_CHOICES = [OUTLIER_METHOD_NONE, OUTLIER_METHOD_QUAROT, OUTLIER_METHOD_HADANORM]
+OUTLIER_METHOD_CHOICES = [
+    OUTLIER_METHOD_NONE,
+    OUTLIER_METHOD_CONVROT,
+    OUTLIER_METHOD_QUAROT,
+    OUTLIER_METHOD_HADANORM,
+]
 _QUAROT_GROUP_SIZE = 128
+_CONVROT_GROUP_SIZE = 256
 _QUAROT_OFFSET_WARNED: set[tuple[int, int, int] | str] = set()
 _HADANORM_ALPHA = 0.5
 _HADANORM_EPS = 1e-6
@@ -184,7 +199,29 @@ def _get_module_outlier_method(module) -> str:
 
 def _outlier_method_uses_hadamard(method) -> bool:
     normalized = _normalize_outlier_method(method)
-    return normalized in (OUTLIER_METHOD_QUAROT, OUTLIER_METHOD_HADANORM)
+    return normalized in (OUTLIER_METHOD_QUAROT, OUTLIER_METHOD_CONVROT, OUTLIER_METHOD_HADANORM)
+
+def _get_outlier_group_size(method) -> int:
+    normalized = _normalize_outlier_method(method)
+    if normalized == OUTLIER_METHOD_CONVROT:
+        return _CONVROT_GROUP_SIZE
+    return _QUAROT_GROUP_SIZE
+
+def _build_outlier_hadamard(method, group_size: int, device=None, dtype=torch.float32):
+    normalized = _normalize_outlier_method(method)
+    if normalized == OUTLIER_METHOD_CONVROT:
+        if not _CONVROT_AVAILABLE:
+            return None
+        return _convrot_build_hadamard(group_size, device=device, dtype=dtype)
+    if not _QUAROT_AVAILABLE:
+        return None
+    return _quarot_build_hadamard(group_size, device=device, dtype=dtype)
+
+def _rotate_weight_for_outlier_method(weight: Tensor, h_matrix: Tensor, group_size: int, method) -> Tensor:
+    normalized = _normalize_outlier_method(method)
+    if normalized == OUTLIER_METHOD_CONVROT:
+        return _convrot_rotate_weight(weight, h_matrix, group_size=group_size)
+    return _quarot_rotate_weight(weight, h_matrix, group_size=group_size)
 
 def _compute_hadanorm_sigma(weight: Tensor) -> Tensor:
     weight_f = weight.float()
@@ -889,13 +926,14 @@ def _transform_weight_like_for_outlier_method(
     offset=None,
 ) -> Tensor:
     method = _normalize_outlier_method(outlier_method)
+    group_size = _get_outlier_group_size(method)
     if method == OUTLIER_METHOD_NONE:
         return weight_like
-    if weight_like.ndim < 2 or weight_like.shape[1] % _QUAROT_GROUP_SIZE != 0:
+    if weight_like.ndim < 2 or weight_like.shape[1] % group_size != 0:
         return weight_like
     if not _outlier_method_uses_hadamard(method):
         return weight_like
-    if not _hadamard_offset_supported(offset, weight_like.shape[1], _QUAROT_GROUP_SIZE):
+    if not _hadamard_offset_supported(offset, weight_like.shape[1], group_size):
         normalized = _normalize_dynamic_offset(offset)
         key = normalized if normalized is not None else "unsupported_offset"
         if key not in _QUAROT_OFFSET_WARNED:
@@ -907,8 +945,6 @@ def _transform_weight_like_for_outlier_method(
         return weight_like
 
     try:
-        if not _QUAROT_AVAILABLE:
-            return weight_like
         rotate_dtype = torch.float32 if weight_like.dtype in (torch.float16, torch.bfloat16) else weight_like.dtype
         weight_work = weight_like.to(comp_device, dtype=rotate_dtype)
         if method == OUTLIER_METHOD_HADANORM:
@@ -921,8 +957,10 @@ def _transform_weight_like_for_outlier_method(
                 return weight_like
             sigma = sigma.to(comp_device, dtype=rotate_dtype, non_blocking=True).view(1, -1)
             weight_work = weight_work * sigma
-        h_matrix = _quarot_build_hadamard(_QUAROT_GROUP_SIZE, device=comp_device, dtype=rotate_dtype)
-        rotated = _quarot_rotate_weight(weight_work, h_matrix, group_size=_QUAROT_GROUP_SIZE)
+        h_matrix = _build_outlier_hadamard(method, group_size, device=comp_device, dtype=rotate_dtype)
+        if h_matrix is None:
+            return weight_like
+        rotated = _rotate_weight_for_outlier_method(weight_work, h_matrix, group_size=group_size, method=method)
         return rotated.to(weight_like.dtype)
     except Exception:
         return weight_like
@@ -936,7 +974,8 @@ def _apply_outlier_activation_transform(
     method = _normalize_outlier_method(outlier_method)
     if method == OUTLIER_METHOD_NONE or not isinstance(hadamard, torch.Tensor):
         return x, None
-    if x.shape[-1] % _QUAROT_GROUP_SIZE != 0:
+    group_size = int(hadamard.shape[-1])
+    if group_size <= 0 or x.shape[-1] % group_size != 0:
         return x, None
 
     transform_dtype = torch.float32 if x.device.type == "cpu" and x.dtype in (torch.float16, torch.bfloat16) else x.dtype
@@ -954,7 +993,7 @@ def _apply_outlier_activation_transform(
     if h_matrix.device != x_work.device or h_matrix.dtype != x_work.dtype:
         h_matrix = h_matrix.to(x_work.device, dtype=x_work.dtype, non_blocking=True)
 
-    x_rotated = _rotate_activation_runtime(x_work, h_matrix, _QUAROT_GROUP_SIZE)
+    x_rotated = _rotate_activation_runtime(x_work, h_matrix, group_size)
     if method == OUTLIER_METHOD_HADANORM:
         correction_source = x_rotated.mean(dim=-2, keepdim=True)
         return x_rotated - correction_source, correction_source
@@ -976,6 +1015,17 @@ def _apply_int8_delta_inplace(weight, delta_f, weight_scale, seed, offset=None):
     weight.copy_(patched_weight)
     del patched_weight
     return weight
+
+def _decode_comfy_quant_config(value):
+    if not isinstance(value, torch.Tensor):
+        return None
+    try:
+        return json.loads(value.detach().cpu().numpy().tobytes())
+    except Exception:
+        return None
+
+def _encode_comfy_quant_config(config: dict) -> Tensor:
+    return torch.tensor(list(json.dumps(config, separators=(",", ":")).encode("utf-8")), dtype=torch.uint8)
 
 try:
     from comfy.weight_adapter.lora import LoRAAdapter
@@ -1669,7 +1719,7 @@ if _COMFY_OPS_AVAILABLE:
                 weight_scale = state_dict.pop(scale_key, None)
                 stored_hadamard = state_dict.pop(hadamard_key, None)
                 stored_hadanorm_sigma = state_dict.pop(hadanorm_sigma_key, None)
-                state_dict.pop(prefix + "comfy_quant", None)
+                native_quant_config = _decode_comfy_quant_config(state_dict.pop(prefix + "comfy_quant", None))
                 weight_tensor = state_dict.pop(weight_key, None)
 
                 # Pop input_scale to clean state_dict, but ignore it
@@ -1710,6 +1760,25 @@ if _COMFY_OPS_AVAILABLE:
                             if self._outlier_method == OUTLIER_METHOD_NONE:
                                 self._use_quarot = True
                                 self._outlier_method = OUTLIER_METHOD_QUAROT
+                        if (
+                            self._outlier_method == OUTLIER_METHOD_NONE
+                            and isinstance(native_quant_config, dict)
+                            and native_quant_config.get("format") == "int8_tensorwise"
+                            and native_quant_config.get("convrot", False)
+                        ):
+                            convrot_group_size = int(native_quant_config.get("convrot_groupsize", _CONVROT_GROUP_SIZE))
+                            try:
+                                h_matrix = _build_outlier_hadamard(
+                                    OUTLIER_METHOD_CONVROT,
+                                    convrot_group_size,
+                                    device="cpu",
+                                    dtype=torch.float32,
+                                )
+                                if h_matrix is not None:
+                                    self.quarot_hadamard = h_matrix
+                                    self._outlier_method = OUTLIER_METHOD_CONVROT
+                            except Exception as e:
+                                logging.warning(f"INT8 Toolkit: ConvRot metadata ignored for {prefix} ({e}).")
                             
                     elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32) or _is_float8_dtype(weight_tensor.dtype):
                         # Load High-Precision
@@ -1767,17 +1836,19 @@ if _COMFY_OPS_AVAILABLE:
 
                             if (
                                 outlier_method != OUTLIER_METHOD_NONE
-                                and _QUAROT_AVAILABLE
                                 and w_gpu.ndim == 2
-                                and w_gpu.shape[1] % _QUAROT_GROUP_SIZE == 0
+                                and w_gpu.shape[1] % _get_outlier_group_size(outlier_method) == 0
                             ):
                                 try:
-                                    h_matrix = _quarot_build_hadamard(_QUAROT_GROUP_SIZE, device=device, dtype=w_gpu.dtype)
+                                    group_size = _get_outlier_group_size(outlier_method)
+                                    h_matrix = _build_outlier_hadamard(outlier_method, group_size, device=device, dtype=w_gpu.dtype)
+                                    if h_matrix is None:
+                                        raise RuntimeError(f"{outlier_method} Hadamard helper is unavailable")
                                     if outlier_method == OUTLIER_METHOD_HADANORM:
                                         hadanorm_sigma = _compute_hadanorm_sigma(w_gpu).to(device=device, dtype=w_gpu.dtype)
                                         w_gpu = w_gpu * hadanorm_sigma.view(1, -1)
                                         self.hadanorm_sigma = hadanorm_sigma.detach().cpu()
-                                    w_gpu = _quarot_rotate_weight(w_gpu, h_matrix, group_size=_QUAROT_GROUP_SIZE)
+                                    w_gpu = _rotate_weight_for_outlier_method(w_gpu, h_matrix, group_size=group_size, method=outlier_method)
                                     self.quarot_hadamard = h_matrix.detach().cpu()
                                     self._use_quarot = outlier_method == OUTLIER_METHOD_QUAROT
                                     self._outlier_method = outlier_method
@@ -1826,6 +1897,26 @@ if _COMFY_OPS_AVAILABLE:
                     self.bias = nn.Parameter(bias_tensor, requires_grad=False)
                 else:
                     self.bias = None
+
+            def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
+                output = super().state_dict(*args, destination=destination, prefix=prefix, keep_vars=keep_vars)
+                if not getattr(self, "_is_quantized", False):
+                    return output
+
+                outlier_method = _get_module_outlier_method(self)
+                if outlier_method not in (OUTLIER_METHOD_NONE, OUTLIER_METHOD_CONVROT):
+                    return output
+
+                quant_config = {"format": "int8_tensorwise"}
+                if outlier_method == OUTLIER_METHOD_CONVROT:
+                    hadamard = getattr(self, "quarot_hadamard", None)
+                    convrot_group_size = int(hadamard.shape[-1]) if isinstance(hadamard, torch.Tensor) else _CONVROT_GROUP_SIZE
+                    quant_config["convrot"] = True
+                    quant_config["convrot_groupsize"] = convrot_group_size
+                    output.pop(prefix + "quarot_hadamard", None)
+
+                output[prefix + "comfy_quant"] = _encode_comfy_quant_config(quant_config)
+                return output
 
             def _replace_weight(self, new_weight, inplace_update=False):
                 if inplace_update:

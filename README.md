@@ -1,14 +1,31 @@
 # ComfyUI-INT8-Toolkit
 
-INT8 quantization stores model weights in 8-bit integers instead of higher-precision formats, reducing VRAM use and accelerating matrix-heavy inference on GPUs with strong INT8 throughput. This is especially useful on Ampere cards such as the RTX 30 series. The tradeoff is that quantization changes model numerics, so quality-sensitive layers, LoRA order, runtime backends, and Torch Compile behavior all matter.
+INT8 quantization stores model weights in 8-bit integers instead of higher-precision formats. On GPUs with strong INT8 throughput, this can reduce VRAM use and speed up transformer-heavy diffusion models. The tradeoff is that quantization changes model numerics, so layer targeting, LoRA order, runtime backend, outlier handling, and Torch Compile behavior all matter.
 
 This project began as a fork of [ComfyUI-INT8-Fast](https://github.com/BobJohnson24/ComfyUI-INT8-Fast), but it is now maintained as its own INT8 toolkit for ComfyUI.
 
 ![workflow](example_workflows/load_workflow.png)
 
-The main differentiator is `Enable INT8 on MODEL`: a `MODEL -> MODEL` adapter that converts a model loaded by ComfyUI's stock diffusion loader into this extension's INT8 runtime. Standard diffusion loaders and stock LoRA loaders can stay in the workflow, then INT8 can be enabled after those patches are in place.
+## Current INT8 Landscape
 
-Other notable features include unified INT8 LoRA nodes, stock-loader LoRA baking, selectable INT8 runtime backends, small-batch fallback controls, an experimental prepacked-weight path, a lazy Torch Compile node, and safer Triton edge-tile handling.
+ComfyUI now has native INT8 checkpoint loading through the standard `Load Diffusion Model` node when a checkpoint contains native `.comfy_quant` metadata. That is the best path when you already have a native-format INT8 checkpoint and do not need extra conversion, INT8-specific LoRA behavior, or Toolkit runtime controls.
+
+The Toolkit remains useful when you want:
+
+- `Enable INT8 on MODEL`: convert a stock-loaded `MODEL` after regular loaders and stock LoRA nodes have run.
+- On-the-fly INT8 quantization from float or FP8 checkpoints.
+- Architecture-specific exclusion presets.
+- INT8-aware LoRA modes: `Stochastic`, `Dynamic`, and `Standard`.
+- Lazy Torch Compile behavior tuned around INT8 object patches.
+- Runtime backend controls, small-batch fallback, diagnostics, and native-format export for compatible INT8 layers.
+
+| Project | Best Fit | Notes |
+| --- | --- | --- |
+| ComfyUI core INT8 | Native-format pre-quantized checkpoints loaded with stock `Load Diffusion Model`. | No special Toolkit nodes required. Stock LoRA patching is generic and can disable the fast quantized path for patched layers. |
+| ComfyUI-INT8-Fast | Historical upstream implementation and preset source. | Upstream is effectively retired now that ComfyUI has native INT8 loading. This Toolkit selectively adapts useful preset/runtime work. |
+| ComfyUI-INT8-Toolkit | Conversion, stock-loader adaptation, INT8-aware LoRA handling, compile/runtime tuning, and experimentation. | Use this when you need more control than core exposes or want to quantize models locally. |
+
+See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## Recommended Workflows
 
@@ -26,7 +43,7 @@ Load Diffusion Model
 
 With `bake_loaded_loras` enabled, `Enable INT8 on MODEL` applies stock LoRA weight patches in float space, quantizes the resulting layer weights, and removes consumed patches so they are not applied twice. Bias patches and excluded-layer patches are left for ComfyUI to handle normally.
 
-### Pre-Quantized Or OTF INT8 Loader
+### Pre-Quantized Or On-The-Fly INT8
 
 Use this when you are already loading an INT8 checkpoint, or when you want the extension to quantize eligible layers during model load.
 
@@ -36,8 +53,6 @@ Load Diffusion Model INT8 (W8A8)
 -> optional INT8 Lazy Torch Compile
 -> sampler
 ```
-
-`Load Diffusion Model INT8 (W8A8)` supports pre-quantized INT8 checkpoints and optional on-the-fly quantization for float or FP8 source weights.
 
 ### Add Or Swap LoRAs After INT8
 
@@ -49,55 +64,49 @@ INT8 model
 -> sampler
 ```
 
-`Load LoRA INT8` has a `mode` selector:
+`Load LoRA INT8` modes:
 
 - `Stochastic`: applies the LoRA delta into INT8 weights with stochastic rounding.
 - `Dynamic`: keeps compatible plain LoRAs as runtime additions instead of modifying INT8 weights.
-- `Standard`: applies the LoRA through ComfyUI's regular MODEL patch path without INT8-specific handling. This is useful for pre-INT8 A/B testing against `Stochastic`.
+- `Standard`: applies LoRA through ComfyUI's regular MODEL patch path without INT8-specific handling.
 
-## Node Summary
+## Nodes
 
 ### Enable INT8 on MODEL
 
 Converts an already-loaded diffusion `MODEL` to INT8 by object-patching eligible linear layers.
 
-Settings:
+Key settings:
 
-- `model_type`: defaults to `auto`, which inspects the loaded `MODEL` and selects a known exclusion preset when possible. Use a specific preset to override detection. Use `flux2_fast_unsafe` only when you want faster upstream-style Flux2/Klein targeting and can tolerate skipped/wrong layer targeting risk. Use `none` only for experiments because it disables preset exclusions.
-- `outlier_method`: choose `none`, `quarot`, or `hadanorm`. `none` is fastest. `quarot` applies Hadamard rotation for compatible layers. `hadanorm` adds static per-channel scaling, Hadamard mixing, dynamic centering, and a runtime correction term.
-- `small_batch_fallback`: defaults to `only_small_layers`. This falls back to fp16/bf16 math for tiny activation row counts only when the layer has `out_features * in_features <= INT8_SMALL_LAYER_MAX_PARAMS` (default `1000000`). `always` may help very small row counts but often slows larger layers because it dequantizes full weights. `never` forces the selected INT8 backend.
-- `runtime_backend`: defaults to `torch_int_mm`. `torch_int_mm` uses PyTorch `torch._int_mm` with CUDA padding for tiny row counts and non-8-aligned output columns. `triton` uses this extension's fused Triton kernels and may be faster on some model shapes. `triton_legacy_unsafe` reproduces old upstream edge-tile behavior for diagnostics only and may produce incorrect output on tail shapes.
-- `prepack_int8_weights`: experimental. Keeps an extra transposed INT8 weight buffer for the Triton path. This is a simple contiguous transpose, not a cuBLASLt/CUTLASS packed layout, so it can be neutral or slower and costs roughly one extra INT8 copy of each quantized weight.
+- `model_type`: defaults to `auto`, which inspects the loaded `MODEL` and selects a known exclusion preset when possible. Use `none` only for experiments.
+- `outlier_method`: choose `none`, `convrot`, `quarot`, or `hadanorm`.
+- `small_batch_fallback`: defaults to `only_small_layers`, which avoids slow full-weight dequantization on large layers.
+- `runtime_backend`: defaults to `torch_int_mm`; `triton` is available for shape-dependent testing.
+- `prepack_int8_weights`: experimental extra transposed INT8 weight buffer for the Triton path.
 - `bake_loaded_loras`: applies current stock LoRA weight patches before quantization and removes consumed patches.
-- `log_progress`: prints quantization progress and layer counts.
-
-If `auto` cannot identify the architecture, the adapter uses a conservative union of known exclusion patterns and logs a warning. Manual `model_type` selection is faster when you know the architecture.
 
 ### Load Diffusion Model INT8 (W8A8)
 
-Loads INT8 diffusion models using `Int8TensorwiseOps` and architecture-specific exclusion presets.
-
-When `on_the_fly_quantization` is enabled, eligible float or FP8 weights are quantized to INT8 with per-row weight scales. The loader exposes the same `outlier_method`, `small_batch_fallback`, `runtime_backend`, and `prepack_int8_weights` controls as `Enable INT8 on MODEL`.
+Loads INT8 diffusion models using `Int8TensorwiseOps` and architecture-specific exclusion presets. It also supports on-the-fly quantization of eligible float or FP8 weights.
 
 Supported `model_type` presets:
 
 - `anima`
+- `boogu`
 - `chroma`
 - `ernie`
 - `flux2`
 - `flux2_fast_unsafe`
 - `hidream o1`
 - `ideogram4`
+- `krea2`
 - `ltx2`
 - `qwen`
 - `sdxl`
 - `wan`
 - `z-image`
 
-`flux2_fast_unsafe` is opt-in. In `Enable INT8 on MODEL`, it uses the less conservative upstream-style Flux2 exclusion list and first tries a faster raw linear-like scan; if that would find no layers in a stock-loaded Comfy object graph, it falls back to normal Comfy linear-like targeting so the preset does not become a no-op.
-
-> [!NOTE]
-> SDXL can be slower with INT8 enabled because only linear layers are quantized while convolutional UNet blocks, attention kernels, and other non-INT8 work still dominate runtime. Larger transformer-heavy architectures are more likely to benefit.
+`flux2_fast_unsafe` is opt-in and less conservative. It is mainly useful for experiments where speed matters more than defensive layer targeting.
 
 ### INT8 Lazy Torch Compile
 
@@ -111,108 +120,65 @@ Enable INT8 on MODEL
 -> sampler
 ```
 
-Useful settings:
+This node can compile recognized repeated transformer block lists instead of the whole diffusion model, apply Comfy-style guard filtering, and raise TorchDynamo cache limits for workflows with many compiled modules.
 
-- `compile_transformer_blocks_only`: defaults to enabled. This compiles recognized repeated transformer block lists instead of the entire diffusion model, reducing cold-start compilation and avoiding some parent-wrapper guard churn.
-- Flux2/Klein-style models with global modulation are automatically compiled as the whole diffusion model, because compiling only `double_blocks` and `single_blocks` can cross an unsafe boundary and produce invalid output.
-- `use_guard_filter`: defaults to enabled. This ignores guards involving `transformer_options`, matching Comfy's stock compile behavior and reducing recompiles caused by per-sampling metadata.
-- `dynamic`: defaults to `true`, which is usually safer when image sizes or batch shapes change. `false` can be faster for fixed shapes.
-- `mode`: supports `default`, `max-autotune`, `max-autotune-no-cudagraphs`, and `reduce-overhead`. With the `inductor` backend and `use_guard_filter` enabled, the node expands the selected mode into Inductor backend options so the guard filter and mode-style tuning can be used together.
-- `dynamo_cache_size_limit`: raises the process cache limit for workflows that compile many repeated modules.
+### Load LoRA INT8 And Load LoRA Stack INT8
 
-The stock `TorchCompileModel` can still be faster for some architectures when whole-model compilation is stable. This lazy node is meant to be the safer INT8-aware option when object patch order, LoRAs, or architecture-specific block compilation matter.
-
-### Load LoRA INT8
-
-Loads one LoRA with selectable `Stochastic`, `Dynamic`, or `Standard` mode.
-
-`Stochastic` mode is the speed-oriented INT8 path and can be queued before `Enable INT8 on MODEL` without collapsing into the same bake behavior as `Standard`. `Dynamic` mode can preserve more of the original LoRA math for compatible plain LoRAs, but it is slower because extra LoRA matmuls run during inference. `Standard` mode uses ComfyUI's regular MODEL LoRA patching without INT8-specific wrapping.
-
-### Load LoRA Stack INT8
-
-Loads up to 10 LoRAs with the same mode behavior as `Load LoRA INT8`.
-
-In `Stochastic` mode, compatible LoRAs are combined before one stochastic rounding step. This is usually better than repeatedly rounding each LoRA one by one. In `Standard` mode, the stack behaves like chaining stock MODEL-only LoRA patches.
+Use these nodes when LoRAs need to be applied after the model is already INT8. In `Stochastic` stack mode, compatible LoRAs are combined before one stochastic rounding step, which is usually better than repeatedly rounding each LoRA one by one.
 
 ### INT8 Kernel Config
 
 Applies fixed Triton kernel settings at runtime. Optional microbench mode tests candidate configs and prints environment variable values that can be reused later.
 
-Environment variables:
+## Outlier Methods
 
-- `INT8_TRITON_AUTOTUNE`
-- `INT8_TRITON_BLOCK_M`
-- `INT8_TRITON_BLOCK_N`
-- `INT8_TRITON_BLOCK_K`
-- `INT8_TRITON_GROUP_SIZE_M`
-- `INT8_TRITON_NUM_WARPS`
-- `INT8_TRITON_NUM_STAGES`
-- `INT8_TRITON_ROWWISE_QUANT_MAX_COLS`
-- `INT8_SMALL_BATCH_FALLBACK_MAX_ROWS`
-- `INT8_SMALL_BATCH_FALLBACK_MIN_ROWS`
-- `INT8_SMALL_LAYER_MAX_PARAMS`
-- `INT8_SMALL_BATCH_FALLBACK_ADAPTIVE`
-- `INT8_RUNTIME_STATS`
-- `INT8_DYNAMIC_LORA_DEBUG`
-- `INT8_DYNAMIC_LORA_BATCH`
-- `INT8_DYNAMIC_LORA_BATCH_MAX_RANK`
-- `INT8_FORCE_DISABLE_TORCH_COMPILE`
-- `INT8_FILE_SLICE_LOAD`
+| Method | Behavior | Native Core Export |
+| --- | --- | --- |
+| `none` | Direct per-row INT8 quantization. Fastest path and default. | Yes |
+| `convrot` | Regular Hadamard rotation with 256-channel groups. Good quality/speed tradeoff and aligns with ComfyUI native metadata. | Yes |
+| `quarot` | Toolkit legacy Hadamard rotation with 128-channel groups. | Toolkit loader required |
+| `hadanorm` | Experimental per-channel scaling plus Hadamard mixing and runtime correction. | Toolkit loader required |
 
-Keep `INT8_RUNTIME_STATS=0` for normal use. Runtime stats are useful for backend diagnosis but add console work and should not be used for performance benchmarking.
-`INT8_FILE_SLICE_LOAD=1` is the default. Set it to `0` to disable the optional Comfy/AIMDO file-slice transfer path used while moving CPU source weights to the CUDA work device for INT8 quantization.
-`INT8_TRITON_ROWWISE_QUANT_MAX_COLS` defaults to `8192`. Wider activation rows fall back to the PyTorch INT8 backend instead of trying the single-block Triton rowwise quantizer.
+For saved checkpoints, plain INT8 and ConvRot layers receive native `.comfy_quant` metadata. QuaRot and HadaNorm layers intentionally do not, because ComfyUI core does not know their Toolkit-specific activation transforms.
 
-## LoRA Order And VRAM Behavior
+## LoRA Order
 
 Some LoRA orders can temporarily materialize large float tensors. On lower-VRAM cards this can look like a sudden spike and may OOM even if normal sampling would fit.
 
-| LoRA method | Before `Enable INT8 on MODEL` | After `Enable INT8 on MODEL` | Notes |
-| --- | --- | --- | --- |
-| Stock `Load LoRA` | Best stock-loader path. The LoRA is baked by `Enable INT8 on MODEL` when `bake_loaded_loras` is enabled. | Avoid for INT8 layers unless testing. ComfyUI's generic patch path may dequantize or build large temporary tensors. | Easiest compatibility path before INT8. Riskier after INT8 because it is not INT8-aware. |
-| `Load LoRA INT8` with `Standard` | Equivalent to a stock-style MODEL-only LoRA patch. Useful when you want the same node surface before INT8 and plan to bake later. | Mainly for testing. It intentionally skips INT8-specific handling. | Best fit for fast A/B comparisons against `Stochastic` on an existing pre-INT8 LoRA stack. |
-| `Load LoRA INT8` with `Stochastic` | Carries deferred INT8-aware patches so `Enable INT8 on MODEL` can quantize the base layer first, then apply the LoRA with stochastic INT8 rounding. | Preferred for adding LoRAs after INT8. | Speed-oriented INT8 LoRA mode. |
-| `Load LoRA INT8` with `Dynamic` | Not the preferred order. Dynamic LoRA state is intended for an INT8 runtime path. | Preferred when the LoRA is compatible and you can accept slower runtime. | Avoids permanently changing INT8 weights, but adds runtime matmuls. Unsupported formats fall back to static-safe patching. |
+| LoRA method | Before `Enable INT8 on MODEL` | After `Enable INT8 on MODEL` |
+| --- | --- | --- |
+| Stock `Load LoRA` | Recommended for stock workflows. Bake with `Enable INT8 on MODEL`. | Avoid for INT8 layers unless testing; core's generic patch path may dequantize patched weights. |
+| `Load LoRA INT8` with `Standard` | Useful for pre-INT8 A/B testing. | Mainly for testing. It intentionally skips INT8-specific handling. |
+| `Load LoRA INT8` with `Stochastic` | Carries deferred INT8-aware patches. | Preferred speed-oriented post-INT8 LoRA mode. |
+| `Load LoRA INT8` with `Dynamic` | Not the preferred order. | Useful when compatible and runtime LoRA matmuls are acceptable. |
 
-Practical guidance:
+Practical defaults:
 
-- For stock workflows, put stock `Load LoRA` before `Enable INT8 on MODEL`.
-- If you want to A/B the same `Load LoRA INT8` or `Load LoRA Stack INT8` graph before INT8 conversion, switch `mode` between `Standard` and `Stochastic`.
-- For already-INT8 workflows, use `Load LoRA INT8` after INT8 is enabled.
-- If a graph OOMs during LoRA application but not during sampling, try the other INT8 LoRA mode, reduce the LoRA stack, or bake the LoRA before INT8 conversion.
+- Put stock `Load LoRA` before `Enable INT8 on MODEL`.
+- Use `Load LoRA INT8` after INT8 is enabled.
 - Leave `bake_loaded_loras` enabled unless you intentionally want patched layers skipped by the adapter.
 
-## Runtime Backend Guidance
+## Runtime Guidance
 
-Backend speed is architecture- and shape-dependent, so benchmark on the workflow you actually use.
+- `torch_int_mm` is the default because it is simple, robust on Windows, and works well on current Toolkit test workflows.
+- `triton` can still be faster on some architecture and shape mixes.
+- `triton_legacy_unsafe` is only for diagnosis and may produce incorrect output on tail shapes.
+- `small_batch_fallback=only_small_layers` is the recommended default.
+- Keep `INT8_RUNTIME_STATS=0` for normal benchmarking; diagnostics add console overhead.
 
-- `torch_int_mm` is the default because it is simple, robust on Windows, and tested well on Z-Image Turbo in current workflows.
-- `triton` can still be faster on some architectures and shape mixes, especially when its fused dynamic-quantization path avoids extra PyTorch overhead.
-- `triton_legacy_unsafe` is only for diagnosis. It keeps the old modulo edge-tile behavior and may read wrapped values for non-divisible output shapes.
-- `prepack_int8_weights` currently stores only `weight.T.contiguous()`. A real Ampere-optimized packed layout would require a cuBLASLt, CUTLASS, or custom-kernel path.
-- `small_batch_fallback=only_small_layers` is the recommended default based on current Anima and Z-Image Turbo testing.
+Torch Compile is often the difference between "INT8 works" and "INT8 is actually fast" in ComfyUI. Put `INT8 Lazy Torch Compile` after `Enable INT8 on MODEL`, use `compile_transformer_blocks_only=True` unless an architecture needs whole-model compilation, and restart ComfyUI after failed compile experiments before drawing conclusions.
 
-## Torch Compile Guidance
+## Model Save
 
-Torch Compile is often the difference between "INT8 works" and "INT8 is actually fast" in ComfyUI.
+`Save Model INT8 (DynamicVRAM Safe)` saves Toolkit INT8-patched `MODEL` outputs.
 
-Recommended defaults:
-
-- Put `INT8 Lazy Torch Compile` after `Enable INT8 on MODEL`.
-- Use `compile_transformer_blocks_only=True` unless an architecture benefits from whole-model compilation.
-- Use `use_guard_filter=True` for normal ComfyUI workflows.
-- Use `dynamic=true` when changing image size or batch shape. Try `dynamic=false` only for fixed workflows.
-- After source-code hot reloads or failed compile experiments, restart ComfyUI before drawing conclusions. TorchDynamo guards and generated kernels can outlive local Python edits inside the same process.
-
-If you launch ComfyUI through this project's `run.bat`, TorchInductor and Triton compile artifacts are stored under the local `torch_compile_cache` directory.
-
-## ModelSave Round Trip
-
-If you quantize with `on_the_fly_quantization` and save with ComfyUI `ModelSave`, the saved checkpoint can be loaded back with `Load Diffusion Model INT8 (W8A8)` without re-quantizing as long as the checkpoint includes INT8 `weight` tensors and matching `weight_scale` tensors.
+- Plain INT8 and ConvRot layers include native ComfyUI `.comfy_quant` metadata.
+- QuaRot and HadaNorm layers are Toolkit-specific and should be reloaded with `Load Diffusion Model INT8 (W8A8)`.
+- The save node prints counts for INT8 weights, `weight_scale` tensors, and native `.comfy_quant` layers so compatibility is visible.
 
 ## Checkpoint Notes
 
-Pre-quantized checkpoints are still useful when available. On-the-fly quantization is more flexible, but it requires loading source weights and quantizing them locally. On a Geforce RTX 3090, this process should usually take seconds rather than minutes once the environment is warm.
+Pre-quantized checkpoints are still useful when available. On-the-fly quantization is more flexible, but it requires loading source weights and quantizing them locally.
 
 Vistralis checkpoints:
 
@@ -239,23 +205,6 @@ Additional checkpoints:
 - `triton-windows` for the optional fused Triton backend on Windows
 
 Windows note: use the Triton build that matches your PyTorch/CUDA stack. In the tested Comfy Anaconda environment, PyTorch `2.8.0+cu126` imports Triton `3.4.0` from `triton-windows 3.4.0.post21`.
-
-## Recent Development Changes
-
-- Added `runtime_backend` and removed the old visible `use_triton` switch.
-- Changed the default backend to `torch_int_mm`.
-- Added `small_batch_fallback` with `only_small_layers`, `always`, and `never`.
-- Added CUDA-safe padding for `torch._int_mm` tiny-row and non-8-aligned output cases.
-- Fixed Triton edge tiles so tail shapes no longer wrap reads with modulo offsets.
-- Added diagnostic `triton_legacy_unsafe`.
-- Added experimental `prepack_int8_weights`.
-- Added `INT8 Lazy Torch Compile`.
-- Added stable Dynamic LoRA patch UUIDs to avoid unnecessary recomposition.
-- Restored prior INT8 object patches before requantizing.
-- Improved cache-reuse logs and runtime diagnostics.
-- Reordered node inputs so `bake_loaded_loras` and logging controls are near the bottom.
-- Alphabetized model type lists with `auto` first and `none` last where applicable.
-- Added `hidream o1` and opt-in `flux2_fast_unsafe` presets.
 
 ## Credits
 

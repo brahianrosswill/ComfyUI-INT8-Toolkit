@@ -228,7 +228,10 @@ def _summarize_saved_int8_checkpoint(path):
 		int8_weights = 0
 		total_weights = 0
 		weight_scales = 0
+		comfy_quant_layers = 0
 		with safe_open(path, framework="pt", device="cpu") as handle:
+			metadata = handle.metadata()
+			has_legacy_quant_metadata = isinstance(metadata, dict) and "_quantization_metadata" in metadata
 			for key in handle.keys():
 				tensor_slice = handle.get_slice(key)
 				dtype = tensor_slice.get_dtype()
@@ -239,14 +242,27 @@ def _summarize_saved_int8_checkpoint(path):
 						int8_weights += 1
 				elif key.endswith(".weight_scale"):
 					weight_scales += 1
+				elif key.endswith(".comfy_quant"):
+					comfy_quant_layers += 1
 
 		print(
 			"[INT8 Model Save] Saved checkpoint summary "
 			f"(int8_weights={int8_weights}, weight_scales={weight_scales}, "
-			f"total_weights={total_weights}, dtypes={dtype_counts})."
+			f"comfy_quant_layers={comfy_quant_layers}, total_weights={total_weights}, "
+			f"dtypes={dtype_counts})."
 		)
 		if int8_weights == 0 or weight_scales == 0:
 			logging.warning("INT8 Model Save: saved checkpoint does not appear to contain INT8 weights.")
+		elif comfy_quant_layers == 0 and not has_legacy_quant_metadata:
+			logging.warning(
+				"INT8 Model Save: saved checkpoint does not include native ComfyUI .comfy_quant metadata. "
+				"Load it with the Toolkit INT8 loader until native-format export is implemented."
+			)
+		elif comfy_quant_layers < int8_weights and not has_legacy_quant_metadata:
+			logging.warning(
+				"INT8 Model Save: only some INT8 weights include native ComfyUI .comfy_quant metadata. "
+				"Plain INT8 and ConvRot layers can export natively; Toolkit QuaRot/HadaNorm layers require the Toolkit loader."
+			)
 	except Exception as e:
 		logging.warning(f"INT8 Model Save: failed to inspect saved checkpoint ({e}).")
 
