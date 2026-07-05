@@ -135,9 +135,11 @@ Applies fixed Triton kernel settings at runtime. Optional microbench mode tests 
 | Method | Behavior | Native Core Export |
 | --- | --- | --- |
 | `none` | Direct per-row INT8 quantization. Fastest path and default. | Yes |
-| `convrot` | Regular Hadamard rotation with 256-channel groups. Good quality/speed tradeoff and aligns with ComfyUI native metadata. | Yes |
+| `convrot` | ConvRot-style regular Hadamard rotation with 256-channel groups. Good quality/speed tradeoff and aligns with ComfyUI native metadata. | Yes |
 | `quarot` | Toolkit legacy Hadamard rotation with 128-channel groups. | Toolkit loader required |
 | `hadanorm` | Experimental per-channel scaling plus Hadamard mixing and runtime correction. | Toolkit loader required |
+
+The Toolkit's `convrot` path is intended to match ComfyUI/comfy-kitchen native ConvRot INT8 semantics: compatible weights are rotated with grouped regular Hadamard blocks before quantization, and activations are rotated at runtime with the matching transform. This is compatibility work, not a new quantization method; it follows the ConvRot paper's group-wise regular Hadamard rotation and the broader QuaRot rotation-based quantization lineage.
 
 For saved checkpoints, plain INT8 and ConvRot layers receive native `.comfy_quant` metadata. QuaRot and HadaNorm layers intentionally do not, because ComfyUI core does not know their Toolkit-specific activation transforms.
 
@@ -209,6 +211,9 @@ Windows note: use the Triton build that matches your PyTorch/CUDA stack. In the 
 ## Credits
 
 - dxqb / OneTrainer INT8 work: https://github.com/Nerogar/OneTrainer/pull/1034
+- ConvRot paper, "Rotation-Based Plug-and-Play 4-bit Quantization for Diffusion Transformers": https://arxiv.org/abs/2512.03673
+- QuaRot paper, "Outlier-Free 4-Bit Inference in Rotated LLMs": https://arxiv.org/abs/2404.00456
+- ComfyUI and comfy-kitchen native INT8/ConvRot compatibility references: https://github.com/Comfy-Org/ComfyUI and https://github.com/Comfy-Org/comfy-kitchen
 - silveroxides / convert_to_quant: https://github.com/silveroxides/convert_to_quant
 - silveroxides / ComfyUI-QuantOps: https://github.com/silveroxides/ComfyUI-QuantOps
 - newgrit1004 / QuaRot reference code: https://github.com/newgrit1004/ComfyUI-ZImage-Triton

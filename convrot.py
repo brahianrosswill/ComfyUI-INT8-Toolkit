@@ -1,4 +1,11 @@
-"""ConvRot Hadamard helpers for INT8 outlier mitigation."""
+"""ConvRot-style regular Hadamard helpers for INT8 outlier mitigation.
+
+This follows ComfyUI/comfy-kitchen's native ConvRot INT8 convention: rotate
+weights offline with grouped regular Hadamard blocks, then apply the matching
+activation rotation at runtime. The method is based on ConvRot's group-wise
+regular Hadamard rotation and the broader QuaRot rotation-based quantization
+lineage.
+"""
 
 import math
 

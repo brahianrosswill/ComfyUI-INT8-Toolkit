@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 - Expanded Wan Animate exclusions with `face_adapter`, `face_encoder`, `motion_encoder`, and `pose_patch_embedding`.
 - Broadened the `ltx2` exclusion preset for LTX 2.3-sensitive layers.
 - Updated README guidance around ComfyUI core INT8, upstream INT8-Fast, and Toolkit-specific workflows.
+- Clarified ConvRot attribution and native ComfyUI/comfy-kitchen compatibility framing.
 - Moved release-history notes out of the README and into this changelog.
 
 ### Compatibility
