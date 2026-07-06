@@ -2,7 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
-<details open><summary>1.8.0 - 2 July 2026</summary>
+<details open><summary>1.8.1 - 6 July 2026</summary>
+
+### Fixed
+
+- Fixed post-quantization INT8 LoRA stack application for Krea2 and other adapter-quantized MODEL workflows by resolving pending INT8 object patches before falling back to live modules.
+- Fixed stochastic and dynamic LoRA stack cache signatures so changed LoRA sets do not reuse stale adapter outputs.
+- Fixed LoRA adapter wrapping detection so INT8 LoRA patches do not fall through to ComfyUI's generic quantized weight patching path.
+
+</details>
+
+<details><summary>1.8.0 - 2 July 2026</summary>
 
 ### Added
 

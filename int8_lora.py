@@ -6,9 +6,11 @@ import comfy.utils
 import folder_paths
 
 from .int8_lora_patching import (
+	_append_lora_signature,
 	_can_merge_stochastic_stack,
 	_create_stochastic_stack_adapter,
 	_get_key_map,
+	_get_weight_scale_for_module,
 	_model_has_quantized_int8_modules,
 	_resolve_target_module_cached,
 	_upgrade_patch_dict_for_int8,
@@ -20,24 +22,6 @@ LORA_MODE_STOCHASTIC = "Stochastic"
 LORA_MODE_DYNAMIC = "Dynamic"
 LORA_MODE_STANDARD = "Standard"
 LORA_MODE_CHOICES = [LORA_MODE_STOCHASTIC, LORA_MODE_DYNAMIC, LORA_MODE_STANDARD]
-INT8_LORA_SIGNATURE_ATTACHMENT_KEY = "int8_lora_signature"
-
-
-def _get_lora_signature(model_patcher):
-	if not hasattr(model_patcher, "get_attachment"):
-		return ()
-	signature = model_patcher.get_attachment(INT8_LORA_SIGNATURE_ATTACHMENT_KEY)
-	return signature if isinstance(signature, tuple) else ()
-
-
-def _append_lora_signature(model_patcher, mode, lora_name, strength, seed):
-	if not hasattr(model_patcher, "set_attachments"):
-		return
-	signature = _get_lora_signature(model_patcher)
-	model_patcher.set_attachments(
-		INT8_LORA_SIGNATURE_ATTACHMENT_KEY,
-		signature + ((mode, str(lora_name).replace("\\", "/"), float(strength), int(seed)),),
-	)
 
 
 def _dispatch_dynamic_single(model, lora_name, strength):
@@ -146,6 +130,7 @@ class INT8LoraLoader:
 		)
 
 		model_patcher.add_patches(final_patch_dict, strength)
+		_append_lora_signature(model_patcher, mode, lora_name, strength, seed)
 
 		logging.info(
 			f"INT8 LoRA ({mode}): Registered '{lora_name}' with strength {strength:.2f} for {applied_count} quantized layers."
@@ -261,6 +246,8 @@ class INT8LoraLoaderStack:
 					model_patcher.add_patches({key: adapter}, strength)
 
 		model_patcher.add_patches(final_patch_dict, 1.0)
+		for lora_name, strength in lora_entries:
+			_append_lora_signature(model_patcher, mode, lora_name, strength, seed)
 
 		logging.info(f"INT8 LoRA Stack ({mode}): Merged {len(lora_entries)} LoRAs for {applied_count} quantized layers.")
 		print(f"[INT8 LoRA Stack:{mode}] Applied {len(lora_entries)} LoRAs, merged {applied_count} quantized layers.")

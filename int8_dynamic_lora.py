@@ -8,6 +8,7 @@ import uuid
 from .int8_lora_patching import (
     LoRAAdapter,
     _LORA_ADAPTER_AVAILABLE,
+    _append_lora_signature,
     _get_key_map,
     _wrap_static_int8_patches,
 )
@@ -99,6 +100,8 @@ class INT8DynamicLoraLoader:
         # This ensures ComfyUI's cloning handles everything and it's non-sticky
         if "transformer_options" not in model_patcher.model_options:
             model_patcher.model_options["transformer_options"] = {}
+        else:
+            model_patcher.model_options["transformer_options"] = model_patcher.model_options["transformer_options"].copy()
         
         opts = model_patcher.model_options["transformer_options"]
         if "dynamic_loras" not in opts:
@@ -119,6 +122,7 @@ class INT8DynamicLoraLoader:
             wrapped_static = _wrap_static_int8_patches(model_patcher, static_patch_dict, module_cache={})
             model_patcher.add_patches(wrapped_static, strength)
 
+        _append_lora_signature(model_patcher, "Dynamic", lora_name, strength)
         return (model_patcher,)
 
 class INT8DynamicLoraStack:
@@ -162,6 +166,8 @@ class INT8DynamicLoraStack:
 
         if "transformer_options" not in model_patcher.model_options:
             model_patcher.model_options["transformer_options"] = {}
+        else:
+            model_patcher.model_options["transformer_options"] = model_patcher.model_options["transformer_options"].copy()
 
         opts = model_patcher.model_options["transformer_options"]
         existing_loras = opts.get("dynamic_loras", [])
@@ -198,6 +204,8 @@ class INT8DynamicLoraStack:
                     module_cache=module_cache,
                 )
                 model_patcher.add_patches(wrapped_static, strength)
+
+            _append_lora_signature(model_patcher, "Dynamic", lora_name, strength)
 
         logging.info(f"INT8 Dynamic LoRA Stack: Loaded {len(lora_entries)} LoRAs in a single pass.")
         return (model_patcher,)
